@@ -1,0 +1,9 @@
+{
+  "server": "https://controlroom.roadshield.ae",
+  "token": "b8e2ed9ae5def597e6a59f2801fca19fa758ab1a0cd3e9900b708b3aa357bc3c",
+  "download_path": "/share/Recordings",
+  "sync_interval_seconds": 60,
+  "max_concurrent_downloads": 3,
+  "max_download_retries": 3,
+  "retry_delay_seconds": 5
+}

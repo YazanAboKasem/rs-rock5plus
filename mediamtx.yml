@@ -1,0 +1,63 @@
+logLevel: info
+
+api: yes
+apiAddress: 127.0.0.1:9997
+
+rtsp: yes
+rtspAddress: :8554
+
+hls: yes
+hlsAddress: :8888
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+# Allow the dashboard domain to fetch HLS (CORS)
+hlsAllowOrigin: "*"
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcAllowOrigin: "*"
+
+# Disable unused protocols to avoid port conflicts (SRT uses UDP 8000 by default)
+srt: no
+rtmp: no
+
+# ── Recording Configuration ───────────────────────────────────────────────────
+record: no
+recordPath: ./recordings/%path/%Y-%m-%d/%H-%M-%S
+recordFormat: fmp4
+
+# No static paths yet — this device hasn't been registered on the dashboard.
+# sync_camera_config.py fills this in automatically once it is (see connect-to-server.sh).
+paths:
+  # ── front (192.168.1.64) — synced from dashboard ──
+  cam1:
+    source: rtsp://admin:hikvision@12@192.168.1.64:554/Streaming/Channels/101
+    sourceProtocol: tcp
+    record: yes
+
+  cam1_sub:
+    source: rtsp://admin:hikvision@12@192.168.1.64:554/Streaming/Channels/102
+    sourceProtocol: tcp
+    record: yes
+
+  # ── back ptz (192.168.1.165) — synced from dashboard ──
+  cam2:
+    source: rtsp://admin:hikvision@12@192.168.1.65:554/Streaming/Channels/101
+    sourceProtocol: tcp
+    record: yes
+
+  cam2_sub:
+    source: rtsp://admin:hikvision@12@192.168.1.65:554/Streaming/Channels/102
+    sourceProtocol: tcp
+    record: yes
+
+  # ── back (192.168.1.166) — synced from dashboard ──
+  cam3:
+    source: rtsp://admin:hikvision@12@192.168.1.66:554/Streaming/Channels/201
+    sourceProtocol: tcp
+    record: yes
+
+  cam3_sub:
+    source: rtsp://admin:hikvision@12@192.168.1.66:554/Streaming/Channels/201
+    sourceProtocol: tcp
+    record: yes

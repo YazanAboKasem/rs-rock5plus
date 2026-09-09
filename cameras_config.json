@@ -1,0 +1,35 @@
+{
+  "cam1": {
+    "ip": "192.168.1.64",
+    "user": "admin",
+    "password": "hikvision@12",
+    "channel": 1,
+    "type": "hikvision",
+    "rtsp_port": 554,
+    "ptz": false,
+    "label": "front",
+    "role": "FRONT"
+  },
+  "cam2": {
+    "ip": "192.168.1.165",
+    "user": "admin",
+    "password": "hikvision@12",
+    "channel": 1,
+    "type": "hikvision",
+    "rtsp_port": 554,
+    "ptz": false,
+    "label": "back ptz",
+    "role": "REAR_FIXED"
+  },
+  "cam3": {
+    "ip": "192.168.1.166",
+    "user": "admin",
+    "password": "hikvision@12",
+    "channel": 1,
+    "type": "hikvision",
+    "rtsp_port": 554,
+    "ptz": false,
+    "label": "back",
+    "role": "REAR_FIXED"
+  }
+}
