@@ -20,8 +20,9 @@ real, non-empty camera list ever triggers a rewrite.
 
 import json
 import os
+import re
 import sys
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -98,6 +99,20 @@ def rtsp_source(cam: dict, sub: bool) -> str:
     return f"rtsp://{auth}{ip}:{port}/Streaming/Channels/{suffix}"
 
 
+def sanitize_path_key(raw_key: str) -> str:
+    """
+    MediaMTX path names may only contain alphanumeric characters, underscore,
+    dot, tilde, minus or slash. The dashboard's camera_key is meant to be a
+    machine-safe slug (e.g. "cam1"), but it's operator-entered data — a stray
+    space or symbol (e.g. "h 4k") would otherwise be written straight into
+    mediamtx.yml and crash MediaMTX (and the whole device, since it restarts
+    in a loop) on every boot until fixed on the dashboard.
+    """
+    key = re.sub(r"[^A-Za-z0-9_.~/-]", "_", raw_key.strip())
+    key = key.strip("_") or "cam"
+    return key
+
+
 def build_paths_block(cameras: list) -> str:
     lines = [PATHS_MARKER]
     for cam in cameras:
@@ -113,6 +128,13 @@ def build_paths_block(cameras: list) -> str:
         lines.append(f"    source: {rtsp_source(cam, sub=True)}")
         lines.append("    sourceProtocol: tcp")
         lines.append("    record: yes")
+        lines.append("")
+        # Publish-only path (no "source:") for camera-control.py's FFmpeg
+        # transcoder to push its browser-compatible H.264 re-encode to —
+        # MediaMTX rejects RTSP publishing to any path not already declared
+        # in this file, so without this entry the transcoder's ANNOUNCE
+        # fails with "400 Bad Request" and no "{key}_live" stream ever exists.
+        lines.append(f"  {key}_live:")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -147,13 +169,51 @@ def rewrite_mediamtx_yml(cameras: list) -> bool:
     return True
 
 
+def _parsed_urls(cam: dict):
+    for url in (cam.get("rtsp_main_url"), cam.get("rtsp_sub_url")):
+        if url:
+            yield urlparse(url)
+
+
+def resolve_ip(cam: dict) -> str | None:
+    """
+    The dashboard sometimes leaves a camera's "ip"/"username"/"password"
+    fields empty and only supplies a ready-made rtsp_main_url/rtsp_sub_url
+    (the "explicit URL always wins" case in rtsp_source()). MediaMTX still
+    streams fine in that case since it uses those URLs directly — but
+    camera-control.py's PTZ, diagnostics and reachability checks all key off
+    cameras_config.json's plain fields, so leaving them null there made a
+    camera that was actually streaming show up as "OFFLINE" / "Fallback
+    Active" on the dashboard's own test-mode diagnostic, and would have made
+    PTZ commands fail authentication too. Fall back to parsing them out of
+    either URL.
+    """
+    if cam.get("ip"):
+        return cam["ip"]
+    for parsed in _parsed_urls(cam):
+        if parsed.hostname:
+            return parsed.hostname
+    return None
+
+
+def resolve_credential(cam: dict, field: str) -> str | None:
+    key = "username" if field == "user" else "password"
+    if cam.get(key):
+        return cam[key]
+    for parsed in _parsed_urls(cam):
+        value = parsed.username if field == "user" else parsed.password
+        if value:
+            return value
+    return None
+
+
 def write_cameras_config_json(cameras: list):
     data = {}
     for cam in cameras:
         data[cam["camera_key"]] = {
-            "ip": cam.get("ip"),
-            "user": cam.get("username"),
-            "password": cam.get("password"),
+            "ip": resolve_ip(cam),
+            "user": resolve_credential(cam, "user"),
+            "password": resolve_credential(cam, "password"),
             "channel": cam.get("channel", 1),
             "type": cam.get("type", "hikvision"),
             "rtsp_port": cam.get("rtsp_port", 554),
@@ -196,8 +256,28 @@ def main():
         log("Device is registered but has no cameras configured yet — leaving local config untouched.")
         return
 
-    write_cameras_config_json(cameras)
-    rewrite_mediamtx_yml(cameras)
+    valid_cameras = []
+    for cam in cameras:
+        raw_key = cam.get("camera_key") or ""
+        if not raw_key:
+            log(f"Skipping a camera entry with no camera_key: {cam.get('label')}")
+            continue
+        if not (cam.get("ip") or cam.get("rtsp_main_url")):
+            log(f"Skipping camera '{raw_key}' ({cam.get('label')}) — no ip or rtsp_main_url configured on the dashboard yet.")
+            continue
+
+        sanitized_key = sanitize_path_key(raw_key)
+        if sanitized_key != raw_key:
+            log(f"Camera key '{raw_key}' isn't a valid MediaMTX path name — using '{sanitized_key}' instead.")
+        cam["camera_key"] = sanitized_key
+        valid_cameras.append(cam)
+
+    if not valid_cameras:
+        log("No cameras with usable connection info — leaving local config untouched.")
+        return
+
+    write_cameras_config_json(valid_cameras)
+    rewrite_mediamtx_yml(valid_cameras)
     write_event_token_json(result.get("event_api_token"))
 
 

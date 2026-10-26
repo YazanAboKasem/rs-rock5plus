@@ -83,9 +83,10 @@ for arg in sys.argv:
 
 GPS_READER = None
 if GPS_PORT:
-    if GPS_AT_PORT:
-        enable_modem_gps(GPS_AT_PORT, GPS_AT_BAUD)
-    GPS_READER = GpsReader(GPS_PORT, GPS_BAUD)
+    # Re-enable the modem's GNSS engine on every (re)open, not just once at
+    # startup — it turns off whenever the modem resets or is swapped.
+    on_open = (lambda: enable_modem_gps(GPS_AT_PORT, GPS_AT_BAUD)) if GPS_AT_PORT else None
+    GPS_READER = GpsReader(GPS_PORT, GPS_BAUD, on_open=on_open)
     GPS_READER.start()
 
 # ─── Logging ────────────────────────────────────────────────────────────────

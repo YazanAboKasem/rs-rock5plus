@@ -29,10 +29,12 @@ from datetime import datetime, timedelta
 # ─── Configuration ──────────────────────────────────────────────────────────
 import sys
 from device_identity import get_device_id
+from mp4_remux import remux_for_upload
 
 LARAVEL_URL       = "https://controlroom.dubibid.com"
 SURVEILLANCE_TOKEN = "b8e2ed9ae5def597e6a59f2801fca19fa758ab1a0cd3e9900b708b3aa357bc3c"
 SERVER_ID          = get_device_id()  # unique per device, auto-generated — never hand-edit this
+AUTO_UPLOAD        = True  # background upload of recordings, see auto_upload.py
 
 # Allow CLI overrides (e.g. passed from connect-to-server.sh)
 for arg in sys.argv:
@@ -42,6 +44,8 @@ for arg in sys.argv:
         SURVEILLANCE_TOKEN = arg.split("=", 1)[1]
     elif arg.startswith("--server-name=") or arg.startswith("--jetson-name="):
         SERVER_ID = arg.split("=", 1)[1]
+    elif arg == "--no-auto-upload":
+        AUTO_UPLOAD = False
 
 # Cameras are pulled from the dashboard (see sync_camera_config.py, run
 # before this script starts) and cached to cameras_config.json. Falls back
@@ -114,24 +118,18 @@ ws_connected = False
 sync_paused = False
 sync_cancelled = False
 
-# Tracks the currently-running sync (Thread) and its active ffmpeg
-# compression subprocess (Popen), if any. Without this, a user re-clicking
+# Tracks the currently-running sync thread. Without this, a user re-clicking
 # "Start Sync" (e.g. because a previous attempt looked stuck) spawns a
-# second run_vps_sync thread while the first is still alive — sync.cancel
-# only set a flag that's checked between files, so an in-progress ffmpeg
-# compression kept running regardless, and both threads could end up
-# compressing the SAME file to the SAME temp path concurrently, corrupting
-# it (0-duration, bogus-size output). See sync.start handling below.
+# second run_vps_sync thread while the first is still alive, and both end
+# up uploading the same files at once. See sync.start handling below.
 _sync_thread = None
-_active_ffmpeg_proc = None
-_active_ffmpeg_lock = threading.Lock()
 
 # Serializes all ws.send() calls — see send_ws_event() for why this is required.
 _ws_send_lock = threading.Lock()
 
 # Always points at the currently-live connection. Background threads (sync,
 # diagnostics, PTZ) are started with whatever `ws` object was live at the
-# moment they were spawned; a long-running one (e.g. compressing/uploading a
+# moment they were spawned; a long-running one (e.g. uploading a
 # large 4K recording can take minutes) can easily outlive that connection if
 # it drops and reconnects meanwhile. Without this, such a thread keeps
 # sending on the old, now-closed socket forever ("Connection is already
@@ -347,6 +345,9 @@ class TranscoderManager:
             self.stop_transcoder(camera_id)
 
 
+transcoder_manager = TranscoderManager()
+
+
 # ─── Hikvision ISAPI PTZ ──────────────────────────────────────────────────────
 def build_ptz_xml(pan=0, tilt=0, zoom=0):
     """Build Hikvision continuous PTZ XML command."""
@@ -543,10 +544,9 @@ def get_files_to_sync(scope, cameras_filter, days_filter, source='sub'):
     all_files = []
     for root, dirs, files in os.walk(base_dir):
         for f in files:
-            # Skip our own temp compression artifacts — if one is ever left
-            # behind (killed process, crash mid-compress), it's a leftover
-            # partial file, not a real recording, and treating it as one
-            # produces bogus/duplicate entries (0 duration, wrong size).
+            # Skip temp 1080p copies an older agent version (which compressed
+            # before upload) may have left behind after a crash — they're
+            # partial files, not real recordings.
             if f.endswith('.mp4') and '.sync1080p.' not in f:
                 path = os.path.join(root, f)
                 rel_path = os.path.relpath(path, base_dir)
@@ -584,94 +584,6 @@ def get_files_to_sync(scope, cameras_filter, days_filter, source='sub'):
         filtered_files.append((path, rel_path))
 
     return filtered_files
-
-
-SYNC_MAX_HEIGHT = 1080  # cap uploaded recordings at Full HD to save bandwidth
-
-
-def prepare_upload_file(path):
-    """
-    If a recording is above Full HD, transcode a temporary 1080p copy to
-    upload instead — cuts bandwidth substantially (e.g. 4K -> 1080p) with
-    no visible quality loss for playback. Files already <=1080p are
-    uploaded as-is (no re-encode, no quality/generation loss).
-
-    Returns (upload_path, is_temp_file).
-    """
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height",
-             "-of", "csv=p=0:s=x", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5
-        )
-        dims = probe.stdout.strip()
-        width, height = (int(x) for x in dims.split("x")) if "x" in dims else (0, 0)
-    except Exception as e:
-        log.warning(f"[sync] Could not probe resolution for {path}: {e}. Uploading original.")
-        return path, False
-
-    if height <= SYNC_MAX_HEIGHT or width <= 0:
-        return path, False  # already Full HD or smaller
-
-    # Unique per invocation — defense in depth against two compressions of
-    # the same source ever colliding on one output path again.
-    tmp_path = f"{path}.sync1080p.{os.getpid()}.{threading.get_ident()}.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", path,
-        "-vf", f"scale=-2:{SYNC_MAX_HEIGHT}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        tmp_path,
-    ]
-    global _active_ffmpeg_proc
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        with _active_ffmpeg_lock:
-            _active_ffmpeg_proc = proc
-
-        # Poll instead of a single blocking wait(), so sync.cancel (which
-        # only sets a flag) can actually kill this process promptly instead
-        # of leaving it running to completion in the background.
-        start = time.time()
-        while proc.poll() is None:
-            if sync_cancelled:
-                proc.kill()
-                proc.wait()
-                log.info(f"[sync] Compression of {os.path.basename(path)} cancelled.")
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                return path, False
-            if time.time() - start > 900:
-                proc.kill()
-                proc.wait()
-                raise TimeoutError("ffmpeg compression exceeded 900s")
-            time.sleep(0.5)
-
-        with _active_ffmpeg_lock:
-            _active_ffmpeg_proc = None
-
-        if proc.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            log.info(f"[sync] Compressed {os.path.basename(path)} to {SYNC_MAX_HEIGHT}p for upload "
-                      f"({os.path.getsize(path)} -> {os.path.getsize(tmp_path)} bytes)")
-            return tmp_path, True
-        stderr = proc.stderr.read().decode(errors='replace')[:200] if proc.stderr else ''
-        log.warning(f"[sync] Compression failed for {path} (rc={proc.returncode}), uploading original. "
-                    f"stderr={stderr}")
-    except Exception as e:
-        log.warning(f"[sync] Compression error for {path}: {e}. Uploading original.")
-    finally:
-        with _active_ffmpeg_lock:
-            _active_ffmpeg_proc = None
-
-    if os.path.exists(tmp_path):
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-    return path, False
 
 
 def run_vps_sync(ws, request_id, vps_config, options):
@@ -767,35 +679,10 @@ def run_vps_sync(ws, request_id, vps_config, options):
 
         current_file_rel = rel_path.replace(os.sep, '/')
 
-        # source == 'main' means the user explicitly asked for full-res,
-        # uncompressed uploads — skip transcoding entirely rather than
-        # capping at 1080p. (source == 'sub' files are already low-res from
-        # the camera, so prepare_upload_file() no-ops on them anyway.)
-        if source == 'main':
-            upload_path, is_temp_upload = path, False
-        else:
-            # Downscale to Full HD before upload if the recording is larger
-            # (e.g. Camera 3's 4K Main stream) — saves bandwidth, no effect on
-            # files already at or below 1080p. Large 4K files can take a couple
-            # of minutes to compress with zero other feedback in that window,
-            # which reads as "stuck" — tell the browser what's actually
-            # happening instead of leaving it on "Initialising connection...".
-            send_ws_event(ws, "sync.progress", {
-                "request_id": request_id,
-                "files_uploaded": files_uploaded,
-                "files_total": total_files,
-                "bytes_uploaded": bytes_uploaded,
-                "bytes_total": total_bytes,
-                "current_file": current_file_rel,
-                "stage": "compressing",
-                "speed_mbps": 0,
-                "eta_seconds": 0,
-                "percent": round((bytes_uploaded / total_bytes) * 100, 1) if total_bytes > 0 else 0,
-                "failed_files": failed_files
-            })
-
-            upload_path, is_temp_upload = prepare_upload_file(path)
-
+        # No re-encoding — but upload a regular-MP4 copy (index at front,
+        # hvc1 for H.265) so it plays on macOS and seeks instantly; lossless,
+        # see mp4_remux.py. The local recording is left as-is.
+        upload_path, is_temp_upload = remux_for_upload(path, log)
         file_size = os.path.getsize(upload_path)
 
         upload_success = False
@@ -904,12 +791,11 @@ def run_vps_sync(ws, request_id, vps_config, options):
             remaining_file_bytes = max(0, file_size - uploaded_chunk_bytes)
             bytes_uploaded += remaining_file_bytes
 
-        # Clean up the temporary 1080p copy now that the upload attempt is done
         if is_temp_upload:
             try:
                 os.remove(upload_path)
-            except Exception as e:
-                log.warning(f"[sync] Failed to remove temp compressed file {upload_path}: {e}")
+            except OSError as e:
+                log.warning(f"[sync] Failed to remove temp remuxed file {upload_path}: {e}")
 
         if upload_success and not upload_skipped:
             # ── Verify file exists on server with correct size before marking as done ──
@@ -1232,15 +1118,11 @@ def on_message(ws, message):
         global _sync_thread
         if _sync_thread is not None and _sync_thread.is_alive():
             # A sync is already running (e.g. the user re-clicked Start
-            # because a previous attempt looked stuck). Stop it properly —
-            # including killing any in-progress ffmpeg compression — and
-            # wait for it to actually exit before starting the new one, so
-            # two syncs never compress/upload the same file at once.
+            # because a previous attempt looked stuck). Stop it and wait for
+            # it to actually exit before starting the new one, so two syncs
+            # never upload the same file at once.
             log.warning("[sync] New sync.start received while one is already running — cancelling the old one first.")
             sync_cancelled = True
-            with _active_ffmpeg_lock:
-                if _active_ffmpeg_proc is not None:
-                    _active_ffmpeg_proc.kill()
             _sync_thread.join(timeout=15)
 
         _sync_thread = threading.Thread(target=run_vps_sync, args=(ws, request_id, vps_config, options), daemon=True)
@@ -1306,12 +1188,6 @@ def on_message(ws, message):
 
     elif event == "sync.cancel":
         sync_cancelled = True
-        # Kill any in-progress ffmpeg compression immediately instead of
-        # waiting for its next poll tick (up to 0.5s) or letting it run to
-        # completion — see prepare_upload_file().
-        with _active_ffmpeg_lock:
-            if _active_ffmpeg_proc is not None:
-                _active_ffmpeg_proc.kill()
 
     elif event == "jetson.reboot":
         send_ws_event(ws, "jetson.reboot.ack", {"status": "rebooting"})
@@ -1424,10 +1300,23 @@ def main():
     # Start WebSocket client in separate daemon thread
     threading.Thread(target=websocket_client_thread, daemon=True).start()
 
+    # Upload recordings in the background whenever nobody is watching live.
+    if AUTO_UPLOAD:
+        from auto_upload import AutoUploader
+        AutoUploader(
+            recordings_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings"),
+            laravel_url=LARAVEL_URL, token=SURVEILLANCE_TOKEN, server_id=SERVER_ID, log=log,
+            is_manual_sync_running=lambda: _sync_thread is not None and _sync_thread.is_alive(),
+        ).start()
+
     # ── Live (FFmpeg re-encode) pipeline disabled ────────────────────────────
-    # The dashboard now plays the native MediaMTX "Sub" (camX_sub) and "Main"
-    # (camX) streams directly, so the per-camera FFmpeg transcoder
-    # (TranscoderManager) is no longer started, saving CPU/GPU on the Jetson.
+    # The dashboard plays each camera's native MediaMTX stream ("camX" /
+    # "camX_sub") directly, unmodified — no re-encoding, so the camera's own
+    # codec (H.264 or H.265) reaches the viewer as-is. The per-camera FFmpeg
+    # transcoder (TranscoderManager) exists for players that can't decode
+    # H.265 (most non-Safari browsers), but isn't started here since it
+    # would re-encode the video; call transcoder_manager.apply_settings(...)
+    # per camera if that's ever needed again.
 
     try:
         while True:
