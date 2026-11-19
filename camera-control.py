@@ -359,6 +359,23 @@ def build_ptz_xml(pan=0, tilt=0, zoom=0):
 </PTZData>"""
 
 
+def build_position3d_xml(box: dict) -> str:
+    """
+    Hikvision 3D positioning: the camera centres on the box and zooms so it
+    fills the frame. `box` is x0,y0 (drag start) / x1,y1 (drag end) as 0..1
+    fractions of the picture, top-left origin. ISAPI wants 0..255 with the
+    origin at the bottom-left, so Y is flipped. Dragging right-to-left
+    zooms out; start == end just centres on that point.
+    """
+    def x(v): return max(0, min(255, round(float(v) * 255)))
+    def y(v): return max(0, min(255, round((1 - float(v)) * 255)))
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<position3D>
+  <StartPoint><positionX>{x(box["x0"])}</positionX><positionY>{y(box["y0"])}</positionY></StartPoint>
+  <EndPoint><positionX>{x(box["x1"])}</positionX><positionY>{y(box["y1"])}</positionY></EndPoint>
+</position3D>"""
+
+
 def build_stop_xml():
     return """<?xml version="1.0" encoding="utf-8"?>
 <PTZData>
@@ -384,6 +401,37 @@ ACTION_MAP = {
 }
 
 
+def ptz_position(camera_id: str) -> tuple:
+    """Current pan/tilt/zoom of a PTZ camera as (dict, error): azimuth and
+    elevation in degrees (elevation + = down), zoom as 1–25×."""
+    cam = CAMERAS.get(camera_id)
+    if not cam:
+        return None, f"Camera {camera_id} not in local config"
+    try:
+        st = requests.get(
+            f"http://{cam['ip']}/ISAPI/PTZCtrl/channels/{cam['channel']}/status",
+            auth=HTTPDigestAuth(cam["user"], cam["password"]),
+            timeout=ISAPI_TIMEOUT,
+        )
+        pos = {k: re.search(rf"<{k}>(-?\d+)</{k}>", st.text) for k in ("elevation", "azimuth", "absoluteZoom")}
+        if st.status_code != 200 or not all(pos.values()):
+            return None, f"PTZ status unavailable: HTTP {st.status_code}"
+        fc = requests.get(
+            f"http://{cam['ip']}/ISAPI/Image/channels/{cam['channel']}/focusConfiguration",
+            auth=HTTPDigestAuth(cam["user"], cam["password"]),
+            timeout=ISAPI_TIMEOUT,
+        )
+        focus_mode = re.search(r"<focusStyle>([^<]+)</focusStyle>", fc.text)
+        return {
+            "azimuth": int(pos["azimuth"].group(1)) / 10,
+            "elevation": int(pos["elevation"].group(1)) / 10,
+            "zoom": int(pos["absoluteZoom"].group(1)) / 10,
+            "focus_mode": focus_mode.group(1) if focus_mode else None,
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+
 def execute_ptz(camera_id: str, cmd: dict) -> tuple:
     """Execute a PTZ command via Hikvision ISAPI. Returns (success, error)."""
     cam = CAMERAS.get(camera_id)
@@ -406,6 +454,103 @@ def execute_ptz(camera_id: str, cmd: dict) -> tuple:
                 log.info(f"[{camera_id}] → HOME (preset 1)")
                 return True, None
             return False, f"Home failed: HTTP {r.status_code}"
+
+        if action == "position3d":
+            box = cmd.get("box") or {}
+            r = requests.put(
+                f"{base_url}/position3D",
+                data=build_position3d_xml(box).encode("utf-8"),
+                headers={"Content-Type": "application/xml"},
+                auth=auth,
+                timeout=ISAPI_TIMEOUT,
+            )
+            if r.status_code in (200, 204):
+                log.info(f"[{camera_id}] → POSITION3D {box}")
+                return True, None
+            return False, f"ISAPI error: HTTP {r.status_code} — {r.text[:200]}"
+
+        if action == "focus_step":
+            # Manual focus pulse timed here on the device, so network jitter
+            # can't stretch it: dir +1 = far, -1 = near.
+            args = cmd.get("box") or {}
+            direction = 1 if float(args.get("dir", 1)) > 0 else -1
+            ms = max(20, min(2000, int(args.get("ms", 150))))
+            focus_url = f"http://{ip}/ISAPI/System/Video/inputs/channels/{channel}/focus"
+            def focus(v):
+                return requests.put(focus_url, data=f"<FocusData><focus>{v}</focus></FocusData>".encode(),
+                                    headers={"Content-Type": "application/xml"}, auth=auth, timeout=ISAPI_TIMEOUT)
+            r = focus(60 * direction)
+            time.sleep(ms / 1000)
+            focus(0)
+            if r.status_code in (200, 204):
+                log.info(f"[{camera_id}] → FOCUS {'far' if direction > 0 else 'near'} {ms}ms")
+                return True, None
+            return False, f"ISAPI error: HTTP {r.status_code} — {r.text[:200]}"
+
+        if action == "focus_mode":
+            # AUTO = keeps refocusing; SEMIAUTOMATIC = refocuses after a
+            # zoom/move; MANUAL = only changes when told to.
+            mode = str((cmd.get("box") or {}).get("mode", "")).upper()
+            if mode not in ("AUTO", "SEMIAUTOMATIC", "MANUAL"):
+                return False, f"Unknown focus mode: {mode}"
+            fc_url = f"http://{ip}/ISAPI/Image/channels/{channel}/focusConfiguration"
+            fc = requests.get(fc_url, auth=auth, timeout=ISAPI_TIMEOUT).text
+            xml_body = re.sub(r"<focusStyle>[^<]*</focusStyle>", f"<focusStyle>{mode}</focusStyle>", fc, count=1)
+            r = requests.put(fc_url, data=xml_body.encode("utf-8"), headers={"Content-Type": "application/xml"},
+                             auth=auth, timeout=ISAPI_TIMEOUT)
+            if r.status_code in (200, 204):
+                log.info(f"[{camera_id}] → FOCUS MODE {mode}")
+                return True, None
+            return False, f"ISAPI error: HTTP {r.status_code} — {r.text[:200]}"
+
+        if action == "focus_auto":
+            # One-push focus is blocked on this camera (403); in semi-auto mode
+            # it refocuses after any zoom change, so nudge the zoom and back.
+            st = requests.get(f"{base_url}/status", auth=auth, timeout=ISAPI_TIMEOUT)
+            pos = {k: re.search(rf"<{k}>(-?\d+)</{k}>", st.text) for k in ("elevation", "azimuth", "absoluteZoom")}
+            if st.status_code != 200 or not all(pos.values()):
+                return False, f"PTZ status unavailable: HTTP {st.status_code}"
+            elevation, azimuth, zoom = (int(pos[k].group(1)) for k in ("elevation", "azimuth", "absoluteZoom"))
+            def absolute(z):
+                xml = f"<PTZData><AbsoluteHigh><elevation>{elevation}</elevation><azimuth>{azimuth}</azimuth><absoluteZoom>{z}</absoluteZoom></AbsoluteHigh></PTZData>"
+                return requests.put(f"{base_url}/absolute", data=xml.encode(), headers={"Content-Type": "application/xml"},
+                                    auth=auth, timeout=ISAPI_TIMEOUT)
+            absolute(zoom + 5 if zoom < 245 else zoom - 5)
+            time.sleep(1.5)
+            r = absolute(zoom)
+            if r.status_code in (200, 204):
+                log.info(f"[{camera_id}] → FOCUS AUTO")
+                return True, None
+            return False, f"ISAPI error: HTTP {r.status_code} — {r.text[:200]}"
+
+        if action in ("zoom_abs", "move_rel"):
+            # Both start from where the camera is now and go to an absolute
+            # position. Units are tenths: azimuth 0–3600 (grows to the right),
+            # elevation grows downwards, zoom is level × 10 (10 = 1×, 250 = 25×).
+            args = cmd.get("box") or {}
+            st = requests.get(f"{base_url}/status", auth=auth, timeout=ISAPI_TIMEOUT)
+            pos = {k: re.search(rf"<{k}>(-?\d+)</{k}>", st.text) for k in ("elevation", "azimuth", "absoluteZoom")}
+            if st.status_code != 200 or not all(pos.values()):
+                return False, f"PTZ status unavailable: HTTP {st.status_code}"
+            elevation, azimuth, zoom = (int(pos[k].group(1)) for k in ("elevation", "azimuth", "absoluteZoom"))
+            if action == "zoom_abs":
+                zoom = max(10, min(250, round(float(args.get("zoom", 1)) * 10)))
+            else:
+                azimuth = round(azimuth + float(args.get("pan", 0)) * 10) % 3600
+                elevation = max(-900, min(900, round(elevation - float(args.get("tilt", 0)) * 10)))
+            xml_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<PTZData><AbsoluteHigh><elevation>{elevation}</elevation><azimuth>{azimuth}</azimuth><absoluteZoom>{zoom}</absoluteZoom></AbsoluteHigh></PTZData>"""
+            r = requests.put(
+                f"{base_url}/absolute",
+                data=xml_body.encode("utf-8"),
+                headers={"Content-Type": "application/xml"},
+                auth=auth,
+                timeout=ISAPI_TIMEOUT,
+            )
+            if r.status_code in (200, 204):
+                log.info(f"[{camera_id}] → {action.upper()} az={azimuth} el={elevation} zoom={zoom / 10:g}×")
+                return True, None
+            return False, f"ISAPI error: HTTP {r.status_code} — {r.text[:200]}"
 
         values = ACTION_MAP.get(action)
         if values is None:
@@ -1052,6 +1197,45 @@ def send_ws_event(ws, event: str, data: dict):
         log.error(f"[WS] Send failed for '{event}': {e}")
 
 
+# PTZ commands run on one worker thread, in arrival order: executing them
+# inline in on_message made every ISAPI call hold up the next WS frame
+# (a delayed stop = the camera overshoots).
+import queue
+_ptz_queue = queue.Queue()
+
+def _ptz_worker():
+    while True:
+        ws, data = _ptz_queue.get()
+        camera_id = data.get("camera_id")
+        if data.get("action") == "status":
+            # Answer with the position; request_id lets Laravel match the reply
+            position, error = ptz_position(camera_id)
+            send_ws_event(ws, "ptz.command.ack", {
+                "camera_id": camera_id,
+                "command_id": data.get("command_id"),
+                "request_id": data.get("command_id"),
+                "success": position is not None,
+                "error": error,
+                **(position or {}),
+            })
+            continue
+        success, error = execute_ptz(camera_id, {
+            "action": data.get("action"),
+            "speed": data.get("speed", 3),
+            "box": data.get("box"),
+        })
+        if not success:
+            log.error(f"[{camera_id}] PTZ command failed: {error}")
+        send_ws_event(ws, "ptz.command.ack", {
+            "camera_id": camera_id,
+            "command_id": data.get("command_id"),
+            "success": success,
+            "error": error
+        })
+
+threading.Thread(target=_ptz_worker, daemon=True).start()
+
+
 def on_message(ws, message):
     global sync_paused, sync_cancelled
     try:
@@ -1074,21 +1258,7 @@ def on_message(ws, message):
     log.info(f"[WS] Received event: {event}")
 
     if event == "ptz.command":
-        camera_id = data.get("camera_id")
-        command_id = data.get("command_id")
-        action = data.get("action")
-        speed = data.get("speed", 3)
-        
-        success, error = execute_ptz(camera_id, {"action": action, "speed": speed})
-        if not success:
-            log.error(f"[{camera_id}] PTZ command failed: {error}")
-
-        send_ws_event(ws, "ptz.command.ack", {
-            "camera_id": camera_id,
-            "command_id": command_id,
-            "success": success,
-            "error": error
-        })
+        _ptz_queue.put((ws, data))
 
     elif event == "settings.update":
         # Global main loop will pick up settings, or apply immediately
