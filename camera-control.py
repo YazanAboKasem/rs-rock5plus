@@ -22,6 +22,7 @@ import platform
 import socket
 import threading
 import os
+import signal
 import re
 import glob
 from datetime import datetime, timedelta
@@ -1380,7 +1381,12 @@ def on_message(ws, message):
             # Restart=on-failure), and systemd's cgroup cleanup then kills our
             # own relaunch script mid-flight before it can start anything new.
             # Asking systemd itself to restart the unit avoids both problems.
-            os.system("sudo systemctl restart roadshield-surveillance.service")
+            if os.system("sudo -n systemctl restart roadshield-surveillance.service") != 0:
+                # No passwordless sudo on this device — fall back to signalling
+                # our parent connect-to-server.sh. Its cleanup trap exits 1 and
+                # the unit is Restart=always, so systemd relaunches the stack.
+                log.warning("sudo unavailable — restarting by signalling connect-to-server.sh")
+                os.kill(os.getppid(), signal.SIGTERM)
         threading.Thread(target=do_restart_service, daemon=True).start()
 
 
