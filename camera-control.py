@@ -1366,7 +1366,10 @@ def on_message(ws, message):
             time.sleep(2)
             import os
             log.warning("⚠️ Reboot command received from server! Initiating system reboot...")
-            os.system("sudo reboot")
+            # -n: fail instead of waiting for a password nobody can type.
+            # Needs the rule from setup-sudo-restart.sh.
+            if os.system("sudo -n /usr/sbin/reboot") != 0:
+                log.error("Reboot failed: no passwordless sudo — run `sudo ./setup-sudo-restart.sh` once on this device.")
         threading.Thread(target=do_reboot, daemon=True).start()
 
     elif event == "jetson.restart_service":
@@ -1381,7 +1384,7 @@ def on_message(ws, message):
             # Restart=on-failure), and systemd's cgroup cleanup then kills our
             # own relaunch script mid-flight before it can start anything new.
             # Asking systemd itself to restart the unit avoids both problems.
-            if os.system("sudo -n systemctl restart roadshield-surveillance.service") != 0:
+            if os.system("sudo -n /usr/bin/systemctl restart roadshield-surveillance.service") != 0:
                 # No passwordless sudo on this device — fall back to signalling
                 # our parent connect-to-server.sh. Its cleanup trap exits 1 and
                 # the unit is Restart=always, so systemd relaunches the stack.
