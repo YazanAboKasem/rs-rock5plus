@@ -17,7 +17,9 @@ Usage:
     lat, lng = gps.get_position()
 """
 
+import glob
 import serial
+import subprocess
 import time
 import threading
 import logging
@@ -27,14 +29,75 @@ import os
 log = logging.getLogger("gps-service")
 
 
+def _enable_via_modemmanager(retries: int, delay: float) -> bool:
+    """
+    Ask ModemManager to turn on the modem's GNSS engine via its Location API
+    (mmcli --location-enable-gps-unmanaged).
+
+    Once ModemManager owns the modem (needed for it to manage the cellular
+    data connection), it holds the AT port open exclusively, so a raw
+    AT+QGPS=1 write from here would just fail with "port busy" — mmcli is
+    ModemManager's own control channel for the same command and doesn't
+    compete for the port.
+
+    "unmanaged" (not gps-nmea/gps-raw) is required: it starts the engine but
+    leaves the NMEA port closed so GpsReader can open it. With gps-nmea,
+    ModemManager opens the NMEA port itself and GpsReader gets "port busy".
+
+    Needs polkit permission for org.freedesktop.ModemManager1.* when not run
+    as root — installed by setup-modem-gps.sh.
+    """
+    try:
+        modem_list = subprocess.run(
+            ["mmcli", "-L"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception as e:
+        log.debug("mmcli not available: %s", e)
+        return False
+
+    if "/Modem/" not in modem_list:
+        return False
+    modem_path = modem_list.split("/Modem/", 1)[1].split()[0]
+
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                ["mmcli", "-m", modem_path, "--location-enable-gps-unmanaged"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                log.info("Modem GPS engine enabled via ModemManager (modem %s)", modem_path)
+                return True
+            log.warning("mmcli GPS enable attempt %d: %s", attempt, result.stderr.strip())
+        except Exception as e:
+            log.warning("mmcli GPS enable attempt %d failed: %s", attempt, e)
+        time.sleep(delay)
+
+    return False
+
+
 def enable_modem_gps(at_port: str, baudrate: int = 115200, retries: int = 3) -> bool:
     """
-    Turn on the GNSS engine on a Quectel-style modem (e.g. EC25) via AT+QGPS=1.
-    This state is NOT saved across a modem power cycle/reboot, so it must be
-    re-sent every time the agent starts — unlike a UART GPS module (Jetson's
-    /dev/ttyTHS1), which just streams NMEA on its own with no activation step.
-    Returns True if the modem acked with OK (or was already on).
+    Turn on the GNSS engine on a Quectel-style modem (e.g. EC25) so NMEA
+    starts flowing on its dedicated GPS port. This state is NOT saved across
+    a modem power cycle/reboot, so it must be re-sent every time the agent
+    starts — unlike a UART GPS module (Jetson's /dev/ttyTHS1), which just
+    streams NMEA on its own with no activation step.
+
+    Tries ModemManager's Location API first (mmcli) since ModemManager holds
+    the AT port exclusively whenever it's managing the modem for the cellular
+    data connection — a raw AT+QGPS=1 write would just fail as "port busy" in
+    that case. Falls back to writing AT+QGPS=1 directly for setups where
+    ModemManager isn't managing this modem (or isn't installed).
+    Returns True if GPS was enabled (or was already on).
     """
+    if _enable_via_modemmanager(retries, delay=1):
+        return True
+
+    if glob.has_magic(at_port):
+        matches = sorted(glob.glob(at_port))
+        at_port = matches[0] if matches else at_port
+
     for attempt in range(1, retries + 1):
         try:
             with serial.Serial(at_port, baudrate, timeout=2) as ser:
@@ -162,11 +225,19 @@ class GpsReader(threading.Thread):
     and keeps the latest GPS position updated.
     """
 
-    def __init__(self, port: str = "/dev/ttyTHS1", baudrate: int = 9600):
+    def __init__(self, port: str = "/dev/ttyTHS1", baudrate: int = 9600, on_open=None):
+        """
+        port may be a glob (e.g. /dev/serial/by-id/usb-Quectel_*-if01-port0);
+        it is re-resolved on every (re)open so a swapped modem with a different
+        serial number is picked up without restarting.
+        on_open, if given, is called before each (re)open — used to re-enable
+        a modem's GNSS engine, which turns off whenever the modem resets.
+        """
         super().__init__()
         self.daemon = True
         self.port = port
         self.baudrate = baudrate
+        self.on_open = on_open
         self.running = False
 
         self._latitude = None
@@ -194,15 +265,25 @@ class GpsReader(threading.Thread):
 
     def _read_serial(self):
         """Open serial port and continuously read lines."""
+        port = self.port
+        if glob.has_magic(port):
+            matches = sorted(glob.glob(port))
+            if not matches:
+                raise FileNotFoundError(f"no device matches {port}")
+            port = matches[0]
+
+        if self.on_open:
+            self.on_open()
+
         with serial.Serial(
-            self.port,
+            port,
             self.baudrate,
             timeout=2,
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
         ) as ser:
-            log.info("GPS serial port opened: %s", self.port)
+            log.info("GPS serial port opened: %s", port)
 
             while self.running:
                 try:

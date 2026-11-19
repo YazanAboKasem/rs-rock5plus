@@ -83,9 +83,10 @@ for arg in sys.argv:
 
 GPS_READER = None
 if GPS_PORT:
-    if GPS_AT_PORT:
-        enable_modem_gps(GPS_AT_PORT, GPS_AT_BAUD)
-    GPS_READER = GpsReader(GPS_PORT, GPS_BAUD)
+    # Re-enable the modem's GNSS engine on every (re)open, not just once at
+    # startup — it turns off whenever the modem resets or is swapped.
+    on_open = (lambda: enable_modem_gps(GPS_AT_PORT, GPS_AT_BAUD)) if GPS_AT_PORT else None
+    GPS_READER = GpsReader(GPS_PORT, GPS_BAUD, on_open=on_open)
     GPS_READER.start()
 
 # ─── Logging ────────────────────────────────────────────────────────────────
@@ -340,8 +341,22 @@ def handle_open_terminal(command: dict) -> None:
         ACTIVE_TERMINAL_SESSIONS.pop(session_id, None)
 
 
+def handle_restart_service(command: dict) -> None:
+    """Backs the "Reset Service" button on the dashboard. Signals the parent
+    connect-to-server.sh, whose cleanup trap stops MediaMTX/tunnel/agents and
+    exits non-zero — systemd's Restart=always then brings the whole stack back
+    up. No sudo needed since everything runs as this user."""
+    report_command_result(command["id"], "completed", "Restarting surveillance service")
+    log.info(f"Command #{command['id']}: restarting surveillance service")
+    _cleanup_terminal_sessions()
+    os.kill(os.getppid(), signal.SIGTERM)
+
+
 COMMAND_HANDLERS = {
     "open_terminal": handle_open_terminal,
+    "restart_service": handle_restart_service,
+    "reset_service": handle_restart_service,
+    "restart": handle_restart_service,
 }
 
 
@@ -363,6 +378,7 @@ def poll_pending_commands() -> None:
     for command in commands:
         handler = COMMAND_HANDLERS.get(command.get("command"))
         if handler is None:
+            log.warning(f"Unknown command #{command.get('id')}: {command.get('command')!r} payload={command.get('payload')}")
             report_command_result(command["id"], "failed", f"Unknown command: {command.get('command')}")
             continue
         try:

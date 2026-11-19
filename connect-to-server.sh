@@ -224,15 +224,21 @@ echo ""
 
 # ─── 1d. Start device_stats.py (CPU/RAM/temperature reporting) ───────────────
 # GPS auto-detection: a Quectel EC25-style USB LTE+GPS modem exposes NMEA on
-# ttyUSB1 and AT commands on ttyUSB3 — detect it by USB vendor id (2c7c) so
-# devices without this modem (e.g. a Jetson with onboard UART GPS, or no GPS
-# at all) don't get bogus --gps-* flags pointed at a nonexistent port.
+# USB interface 01 and AT commands on interface 02. Resolved via the stable
+# /dev/serial/by-id symlinks (tied to the USB interface number) rather than
+# /dev/ttyUSBn — once ModemManager manages this modem for internet access it
+# can reprobe/reset it and shift the ttyUSBn numbering across boots, which
+# silently broke GPS when it was hardcoded to ttyUSB1/ttyUSB3.
+# The glob itself (not the resolved link) is passed to device_stats.py: the
+# by-id name embeds the modem's serial number, so swapping the modem changes
+# it — GpsReader re-resolves the glob on every reopen.
 GPS_ARGS=()
-if [[ -e /dev/ttyUSB1 ]] && command -v udevadm &>/dev/null; then
-    if udevadm info -q property -n /dev/ttyUSB1 2>/dev/null | grep -q "ID_VENDOR_ID=2c7c"; then
-        GPS_ARGS=(--gps-port=/dev/ttyUSB1 --gps-baud=115200 --gps-at-port=/dev/ttyUSB3 --gps-at-baud=115200)
-        log "مودم Quectel مكتشف — تفعيل GPS على /dev/ttyUSB1"
-    fi
+GPS_NMEA_GLOB='/dev/serial/by-id/usb-Quectel_*-if01-port0'
+GPS_AT_GLOB='/dev/serial/by-id/usb-Quectel_*-if02-port0'
+GPS_NMEA_LINK=$(ls $GPS_NMEA_GLOB 2>/dev/null | head -1)
+if [[ -n "$GPS_NMEA_LINK" ]]; then
+    GPS_ARGS=(--gps-port="$GPS_NMEA_GLOB" --gps-baud=115200 --gps-at-port="$GPS_AT_GLOB" --gps-at-baud=115200)
+    log "مودم Quectel مكتشف — تفعيل GPS على $GPS_NMEA_LINK"
 fi
 
 if command -v python3 &>/dev/null && [[ -f "device_stats.py" ]]; then
