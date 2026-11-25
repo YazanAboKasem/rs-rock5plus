@@ -35,6 +35,7 @@ Settings can be overridden in ~/.roadshield/collector.json, e.g.
     {"sweep_interval": 600}       sweep every 10 min
 """
 import datetime as dt
+import importlib
 import json
 import logging
 import math
@@ -63,6 +64,10 @@ vanishing_point_jpeg = None
 def load_image_libs() -> bool:
     global vanishing_point_jpeg
     if vanishing_point_jpeg is None:
+        # .pylib may not have existed when Python first scanned sys.path, and
+        # the path importer cache would keep reporting it empty after install.
+        sys.path_importer_cache.pop(PYLIB, None)
+        importlib.invalidate_caches()
         try:
             from road_geometry import vanishing_point_jpeg as vp
             vanishing_point_jpeg = vp
@@ -88,6 +93,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(SCRIPT_DIR, "dataset")
 CAMERAS_JSON = os.path.join(SCRIPT_DIR, "cameras_config.json")
 SETTINGS_JSON = os.path.expanduser("~/.roadshield/collector.json")
+# camera-control.py logs every PTZ command it receives from the dashboard;
+# that is the reliable sign an operator is using the PTZ right now.
+CAMERA_CONTROL_LOG = "/tmp/camera-control.log"
 
 DEFAULTS = {
     "enabled": True,
@@ -151,6 +159,24 @@ def load_cameras() -> list:
     return list(cams.values())
 
 
+def last_operator_ptz() -> float:
+    """Epoch time of the latest dashboard PTZ command, 0 if none seen."""
+    try:
+        with open(CAMERA_CONTROL_LOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read().decode(errors="ignore").splitlines()
+    except OSError:
+        return 0.0
+    for line in reversed(tail):
+        if "ptz.command" in line:
+            try:
+                return dt.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
 def free_gb() -> float:
     return shutil.disk_usage(SCRIPT_DIR).free / 1e9
 
@@ -167,6 +193,7 @@ class Camera:
         self.last_kept = {}         # lens -> time of last kept jpeg
         self.expected_pos = None    # where the sweep left the PTZ
         self.backoff_until = 0.0
+        self.sweep_started = 0.0
 
     # ── ISAPI ──
     def snapshot(self, channel: int) -> bytes | None:
@@ -265,7 +292,12 @@ class Camera:
         return (math.degrees(math.atan((x - 0.5) * 2 * th)),
                 math.degrees(math.atan((y - 0.5) * 2 * tv)))
 
+    class OperatorTookOver(Exception):
+        pass
+
     def shot(self, az: int, el: int, zoom: float, cfg: dict, extra: dict | None = None):
+        if last_operator_ptz() >= self.sweep_started:
+            raise self.OperatorTookOver()
         z = int(round(zoom * 10))
         if not self.ptz_goto(az, el, z):
             return None
@@ -286,11 +318,13 @@ class Camera:
         if not start:
             return
         if self.expected_pos and not self.same_pos(start, self.expected_pos):
-            log.info("%s PTZ was moved by someone else — pausing sweeps for %ds", self.ip, cfg["operator_backoff"])
+            log.info("%s PTZ was moved by someone else (%s → %s) — pausing sweeps for %ds",
+                     self.ip, self.expected_pos, start, cfg["operator_backoff"])
             self.backoff_until = time.time() + cfg["operator_backoff"]
             self.expected_pos = None
             return
-        n, aimed = 0, False
+        n, aimed, restore = 0, False, True
+        self.sweep_started = time.time() - 1
         try:
             az0, el0 = start["azimuth"], start["elevation"]
             # 1x from the current heading, then aim at the road's far end
@@ -317,9 +351,18 @@ class Camera:
                         r = self.shot(az0 + round(pan * 10), el0 + round(tilt * 10), zoom, cfg,
                                       {"step": "road", "aimed": aimed})
                         n += bool(r and r[1])
+        except self.OperatorTookOver:
+            # leave the PTZ where the operator is putting it
+            restore = False
+            self.expected_pos = None
+            self.backoff_until = time.time() + cfg["operator_backoff"]
+            log.info("%s operator used the PTZ mid-sweep — stopped after %d images, paused %ds",
+                     self.ip, n, cfg["operator_backoff"])
+            return
         finally:
-            self.ptz_goto(start["azimuth"], start["elevation"], start["absoluteZoom"])
-            self.expected_pos = self.ptz_settled() or start
+            if restore:
+                self.ptz_goto(start["azimuth"], start["elevation"], start["absoluteZoom"])
+                self.expected_pos = self.ptz_settled() or start
         log.info("%s PTZ sweep: %d images (%s)", self.ip, n, "aimed at the road" if aimed else "no vanishing point — 1x/3x only")
 
     def run(self):
@@ -333,7 +376,9 @@ class Camera:
             if now >= next_fixed:
                 next_fixed = now + cfg["fixed_interval"]
                 self.fixed_tick(cfg)
-            if self.has_ptz and now >= next_sweep and now >= self.backoff_until:
+            if now - last_operator_ptz() < cfg["operator_backoff"]:
+                self.expected_pos = None   # operator moved it; start fresh later
+            elif self.has_ptz and now >= next_sweep and now >= self.backoff_until:
                 next_sweep = now + cfg["sweep_interval"]
                 self.sweep(cfg)
             time.sleep(0.5)
