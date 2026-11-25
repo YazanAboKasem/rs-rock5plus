@@ -17,7 +17,12 @@ Per TandemVu camera (one IP, two lenses):
     shrink as the field of view narrows; then the PTZ goes back where it
     was. The far end of the road is where a taper, distant cones and
     approaching traffic are, and the frame centre often is not on the road.
-    Without OpenCV, or when no vanishing point is found, only the 1x/3x
+    When a line of traffic cones is in the 1x frame (colour-based detection)
+    the sweep also zooms on the work zone: 4x on the middle of the cones,
+    8x on the farthest ones — the start of the taper — which also covers
+    curved roads and roundabouts where there is no vanishing point. Cone
+    boxes and the vanishing point are saved in index.jsonl as rough labels.
+    Without OpenCV, or with neither road nor cones in view, only the 1x/3x
     shots are taken (higher zoom on an unknown target mostly frames trees).
 
 Snapshots come straight from the camera (ISAPI .../picture), so no video is
@@ -60,18 +65,19 @@ PYLIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pylib")
 sys.path.insert(0, PYLIB)
 vanishing_point_jpeg = None
 thumb_jpeg = None
+cones_jpeg = None
 
 
 def load_image_libs() -> bool:
-    global vanishing_point_jpeg, thumb_jpeg
+    global vanishing_point_jpeg, thumb_jpeg, cones_jpeg
     if vanishing_point_jpeg is None:
         # .pylib may not have existed when Python first scanned sys.path, and
         # the path importer cache would keep reporting it empty after install.
         sys.path_importer_cache.pop(PYLIB, None)
         importlib.invalidate_caches()
         try:
-            from road_geometry import thumb_jpeg as th, vanishing_point_jpeg as vp
-            vanishing_point_jpeg, thumb_jpeg = vp, th
+            from road_geometry import cones_jpeg as cj, thumb_jpeg as th, vanishing_point_jpeg as vp
+            vanishing_point_jpeg, thumb_jpeg, cones_jpeg = vp, th, cj
         except Exception:
             return False
     return True
@@ -114,8 +120,21 @@ DEFAULTS = {
     # arrow boards and approaching cars (checked on a live work zone).
     "sweep_plan": [[3, [-6, 0, 6], [0]], [6, [-3, 0, 3], [0.6]],
                    [12, [-1.5, 0, 1.5], [0.4, 1.3]], [25, [-0.7, 0, 0.7], [0.25, 0.8]]],
-    "hfov_1x": 57.6,              # horizontal field of view at 1x (degrees)
+    # Measured on q8b7 by panning/tilting a parked camera and phase-
+    # correlating frames: 55.1° x 31.5° at 1x, and the nominal "3x" step
+    # narrows the view 2.54x (3^0.85), not 3x.
+    "hfov_1x": 55.1,
+    "zoom_fov_exponent": 0.85,
     "vp_min_conf": 0.45,          # vanishing-point confidence needed to zoom past 3x
+    # Work-zone shots when a line of cones is in the 1x frame (colour-based,
+    # road_geometry.cone_boxes): one at cone_centre_zoom on the middle of the
+    # cones, then cone_zoom on each of the farthest far_cones — the start of
+    # the taper. Works on curved roads/roundabouts with no vanishing point.
+    # Modest zooms: PTZ pointing is good to ~0.5°, which is a fifth of the
+    # frame at 12x; at 4x/8x the targeted cones stay in the shot.
+    "cone_centre_zoom": 4,
+    "cone_zoom": 8,
+    "far_cones": 3,
     "settle": 3.0,                # s to wait after a move (motion + autofocus)
     "settle_long_zoom": 5.0,      # s at 12x and above (longer focus travel)
     "operator_backoff": 900,      # s to pause sweeps after a manual PTZ move
@@ -182,7 +201,11 @@ def last_operator_ptz() -> float:
 
 
 def free_gb() -> float:
-    return shutil.disk_usage(SCRIPT_DIR).free / 1e9
+    """Free space on the filesystem the dataset is written to."""
+    path = DATASET_DIR
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    return shutil.disk_usage(path).free / 1e9
 
 
 class Camera:
@@ -319,7 +342,7 @@ class Camera:
     @staticmethod
     def frame_to_angles(x: float, y: float, zoom: float, cfg: dict, aspect: float = 1440 / 2560):
         """Offset (pan°, tilt° + = down) of image point (x, y) from the centre."""
-        th = math.tan(math.radians(cfg["hfov_1x"] / 2)) / zoom
+        th = math.tan(math.radians(cfg["hfov_1x"] / 2)) / zoom ** cfg["zoom_fov_exponent"]
         tv = th * aspect
         return (math.degrees(math.atan((x - 0.5) * 2 * th)),
                 math.degrees(math.atan((y - 0.5) * 2 * tv)))
@@ -327,7 +350,8 @@ class Camera:
     class OperatorTookOver(Exception):
         pass
 
-    def shot(self, az: int, el: int, zoom: float, cfg: dict, extra: dict | None = None):
+    def shot(self, az: int, el: int, zoom: float, cfg: dict, extra: dict | None = None) -> dict | None:
+        """Move, settle, snapshot, save. Returns {"vp", "cones", "saved"} or None."""
         if last_operator_ptz() >= self.sweep_started:
             raise self.OperatorTookOver()
         z = int(round(zoom * 10))
@@ -337,13 +361,16 @@ class Camera:
         jpeg = self.snapshot(PTZ_CHANNEL)
         if not jpeg:
             return None
-        vp = vanishing_point_jpeg(jpeg) if zoom <= 3 and load_image_libs() else None
+        libs = zoom <= 3 and load_image_libs()
+        vp = vanishing_point_jpeg(jpeg) if libs else None
+        cones = cones_jpeg(jpeg) if libs and zoom == 1 else []
         meta = {"ptz": {"azimuth": az % 3600, "elevation": el, "zoom": z}}
         if vp:
             meta["vanishing_point"] = {"x": round(vp[0], 4), "y": round(vp[1], 4), "conf": round(vp[2], 2)}
+        if cones:
+            meta["cone_boxes"] = [[round(v, 4) for v in b] for b in cones]
         meta.update(extra or {})
-        saved = self.save("ptz", jpeg, meta, cfg)
-        return vp, saved
+        return {"vp": vp, "cones": cones, "saved": self.save("ptz", jpeg, meta, cfg)}
 
     def sweep(self, cfg: dict):
         start = self.ptz_settled(timeout=5)
@@ -355,22 +382,40 @@ class Camera:
             self.backoff_until = time.time() + cfg["operator_backoff"]
             self.expected_pos = None
             return
-        n, aimed, restore = 0, False, True
+        n, aimed, n_cones, restore = 0, False, 0, True
         self.sweep_started = time.time() - 1
         try:
-            az0, el0 = start["azimuth"], start["elevation"]
-            # 1x from the current heading, then aim at the road's far end
-            r = self.shot(az0, el0, 1, cfg, {"step": "overview"})
-            n += bool(r and r[1])
-            vp = r[0] if r else None
+            az1, el1 = start["azimuth"], start["elevation"]
+            # 1x from the current heading
+            r = self.shot(az1, el1, 1, cfg, {"step": "overview"})
+            n += bool(r and r["saved"])
+            vp = r["vp"] if r else None
+            cones = r["cones"] if r else []
+
+            # work zone: zoom on the cones themselves (also on curved roads)
+            if cones:
+                n_cones = len(cones)
+                cx = sum(b[0] + b[2] / 2 for b in cones) / len(cones)
+                cy = sum(b[1] + b[3] / 2 for b in cones) / len(cones)
+                targets = [(cx, cy, cfg["cone_centre_zoom"], "cones_centre")]
+                targets += [(b[0] + b[2] / 2, b[1] + b[3] / 2, cfg["cone_zoom"], "far_cone")
+                            for b in cones[:cfg["far_cones"]]]
+                for x, y, zoom, step in targets:
+                    if not running:
+                        return
+                    pan, tilt = self.frame_to_angles(x, y, 1, cfg)
+                    r = self.shot(az1 + round(pan * 10), el1 + round(tilt * 10), zoom, cfg, {"step": step})
+                    n += bool(r and r["saved"])
+
+            # far end of the road: aim at the vanishing point, refine at 3x
+            az0, el0 = az1, el1
             if vp and vp[2] >= cfg["vp_min_conf"]:
                 pan, tilt = self.frame_to_angles(vp[0], vp[1], 1, cfg)
-                az0, el0 = az0 + round(pan * 10), el0 + round(tilt * 10)
-                # re-check at 3x: corrects the FOV/lens model error up close
+                az0, el0 = az1 + round(pan * 10), el1 + round(tilt * 10)
                 r = self.shot(az0, el0, 3, cfg, {"step": "aim"})
-                n += bool(r and r[1])
-                if r and r[0] and r[0][2] >= cfg["vp_min_conf"]:
-                    pan, tilt = self.frame_to_angles(r[0][0], r[0][1], 3, cfg)
+                n += bool(r and r["saved"])
+                if r and r["vp"] and r["vp"][2] >= cfg["vp_min_conf"]:
+                    pan, tilt = self.frame_to_angles(r["vp"][0], r["vp"][1], 3, cfg)
                     az0, el0 = az0 + round(pan * 10), el0 + round(tilt * 10)
                     aimed = True
             for zoom, pans, tilts in cfg["sweep_plan"]:
@@ -382,7 +427,7 @@ class Camera:
                             return
                         r = self.shot(az0 + round(pan * 10), el0 + round(tilt * 10), zoom, cfg,
                                       {"step": "road", "aimed": aimed})
-                        n += bool(r and r[1])
+                        n += bool(r and r["saved"])
         except self.OperatorTookOver:
             # leave the PTZ where the operator is putting it
             restore = False
@@ -395,9 +440,11 @@ class Camera:
             if restore:
                 self.ptz_goto(start["azimuth"], start["elevation"], start["absoluteZoom"])
                 self.expected_pos = self.ptz_settled() or start
-        self.no_road_streak = 0 if aimed else self.no_road_streak + 1
-        log.info("%s PTZ sweep: %d images (%s)", self.ip, n, "aimed at the road" if aimed else
-                 f"no vanishing point — 1x/3x only, {self.no_road_streak} in a row")
+        found_road = aimed or n_cones > 0
+        self.no_road_streak = 0 if found_road else self.no_road_streak + 1
+        parts = (["aimed at the road"] if aimed else []) + ([f"{n_cones} cones zoomed"] if n_cones else [])
+        log.info("%s PTZ sweep: %d images (%s)", self.ip, n, ", ".join(parts) if parts else
+                 f"no road or cones found — 1x/3x only, {self.no_road_streak} in a row")
 
     def run(self):
         next_fixed = next_sweep = 0.0

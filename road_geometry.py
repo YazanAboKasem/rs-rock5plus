@@ -26,6 +26,12 @@ def thumb_jpeg(jpeg: bytes):
     return None if img is None else cv2.resize(img, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
+def cones_jpeg(jpeg: bytes):
+    """Cone boxes (x, y, w, h in 0..1), far→near; empty if fewer than 3."""
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    return [] if img is None else cone_boxes(img)
+
+
 def vanishing_point_jpeg(jpeg: bytes):
     """(x, y, confidence) in 0..1 image coordinates, or None."""
     img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
@@ -87,6 +93,34 @@ def vanishing_point(img):
     sol, *_ = np.linalg.lstsq(A * wts[inl, None], b * wts[inl], rcond=None)
     conf = float(wts[inl].sum() / wts.sum())
     return float(sol[0] / W), float(sol[1] / H), conf, segs, inl, scale
+
+
+def cone_boxes(img, horizon=0.35):
+    """Traffic cones by colour: upright saturated orange/red blobs below the
+    horizon with a bright, unsaturated (reflective white) band just above.
+    Returns [(x, y, w, h) in 0..1 image coords] sorted far→near (small→big);
+    empty unless at least 3 are found (cones come in lines)."""
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (1280, int(h * 1280 / w)))
+    H, W = small.shape[:2]
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, (0, 110, 90), (14, 255, 255)) | cv2.inRange(hsv, (165, 110, 90), (180, 255, 255))
+    m[: int(H * horizon)] = 0          # cones stand on the road, below the horizon
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = cv2.dilate(m, np.ones((5, 3), np.uint8))
+    white = cv2.inRange(hsv, (0, 0, 150), (180, 70, 255))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(m)
+    out = []
+    for x, y, bw, bh, area in stats[1:]:
+        if area < 25 or bh < 8 or bh > H * 0.5 or bh / max(bw, 1) < 1.0 or area / (bw * bh) < 0.25:
+            continue
+        # reflective band: white pixels in the strip just above / inside the top of the blob
+        y0, y1 = max(0, y - bh // 2), y + bh // 3
+        band = white[y0:y1, max(0, x - 1):x + bw + 1]
+        if band.size == 0 or band.mean() / 255 < 0.08:
+            continue
+        out.append((x / W, y / H, bw / W, bh / H))
+    return sorted(out, key=lambda b: b[3]) if len(out) >= 3 else []
 
 
 if __name__ == "__main__":
