@@ -59,18 +59,19 @@ from device_identity import get_device_id
 PYLIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pylib")
 sys.path.insert(0, PYLIB)
 vanishing_point_jpeg = None
+thumb_jpeg = None
 
 
 def load_image_libs() -> bool:
-    global vanishing_point_jpeg
+    global vanishing_point_jpeg, thumb_jpeg
     if vanishing_point_jpeg is None:
         # .pylib may not have existed when Python first scanned sys.path, and
         # the path importer cache would keep reporting it empty after install.
         sys.path_importer_cache.pop(PYLIB, None)
         importlib.invalidate_caches()
         try:
-            from road_geometry import vanishing_point_jpeg as vp
-            vanishing_point_jpeg = vp
+            from road_geometry import thumb_jpeg as th, vanishing_point_jpeg as vp
+            vanishing_point_jpeg, thumb_jpeg = vp, th
         except Exception:
             return False
     return True
@@ -102,6 +103,9 @@ DEFAULTS = {
     "fixed_interval": 5,          # s between fixed-lens snapshots
     "fixed_keep_every": 300,      # s — keep one even if the scene looks unchanged
     "sweep_interval": 180,        # s between PTZ sweeps
+    "idle_sweep_interval": 900,   # s between sweeps after idle_after sweeps found no road
+    "idle_after": 3,              #   (parked in a yard, facing a wall, ...)
+    "fixed_diff": 5.0,            # mean abs diff (0..255) of 64x36 thumbnails that counts as a new scene
     # [optical zoom, [pan offsets °], [tilt offsets °, + = down]] around the
     # road's vanishing point. The field of view narrows with zoom (~58° at
     # 1x, ~2.4° at 25x) so offsets shrink with it. At 12x/25x a frame centred
@@ -194,6 +198,10 @@ class Camera:
         self.expected_pos = None    # where the sweep left the PTZ
         self.backoff_until = 0.0
         self.sweep_started = 0.0
+        self.fixed_channel = None   # found by detect_layout()
+        self.layout_checked = 0.0
+        self.no_road_streak = 0
+        self.last_thumb = None
 
     # ── ISAPI ──
     def snapshot(self, channel: int) -> bytes | None:
@@ -227,6 +235,26 @@ class Camera:
         except requests.RequestException:
             return False
 
+    def detect_layout(self) -> bool:
+        """Work out from the camera itself which lens is which: the dashboard's
+        ptz/role flags are inconsistent between cars. A TandemVu answers on
+        channel 201 (fixed wide lens) and has its zoom lens on 101; a
+        single-lens camera only has 101 and gets no sweeps."""
+        if self.fixed_channel:
+            return True
+        if time.time() - self.layout_checked < 60:
+            return False
+        self.layout_checked = time.time()
+        if self.snapshot(FIXED_CHANNEL):
+            self.fixed_channel, self.has_ptz = FIXED_CHANNEL, True
+        elif self.snapshot(PTZ_CHANNEL):
+            self.fixed_channel, self.has_ptz = PTZ_CHANNEL, False
+        else:
+            log.debug("%s not answering — will retry", self.ip)
+            return False
+        log.info("%s: %s", self.ip, "dual-lens (fixed 201 + zoom 101)" if self.has_ptz else "single lens (101), no sweeps")
+        return True
+
     # ── storage ──
     def save(self, lens: str, jpeg: bytes, meta: dict, cfg: dict) -> bool:
         now = dt.datetime.now()
@@ -252,19 +280,23 @@ class Camera:
 
     # ── fixed lens ──
     def fixed_tick(self, cfg: dict):
-        jpeg = self.snapshot(FIXED_CHANNEL)
+        jpeg = self.snapshot(self.fixed_channel)
         if not jpeg:
             return
         now = time.time()
-        last = self.last_size.get("fixed")
-        # Same scene → near-identical JPEG size. Cheap stand-in for an image
-        # diff (no OpenCV on the cars); proper dedup happens off-device.
-        unchanged = last and abs(len(jpeg) - last) / last < 0.015
+        thumb = thumb_jpeg(jpeg) if load_image_libs() else None
+        if thumb is not None and self.last_thumb is not None:
+            unchanged = float(abs(thumb - self.last_thumb).mean()) < cfg["fixed_diff"]
+        else:
+            # no OpenCV yet: same scene → near-identical JPEG size
+            last = self.last_size.get("fixed")
+            unchanged = bool(last) and abs(len(jpeg) - last) / last < 0.015
         if unchanged and now - self.last_kept.get("fixed", 0) < cfg["fixed_keep_every"]:
             return
         if self.save("fixed", jpeg, {}, cfg):
             self.last_size["fixed"] = len(jpeg)
             self.last_kept["fixed"] = now
+            self.last_thumb = thumb
 
     # ── PTZ sweep ──
     def ptz_settled(self, timeout=20.0) -> dict | None:
@@ -363,7 +395,9 @@ class Camera:
             if restore:
                 self.ptz_goto(start["azimuth"], start["elevation"], start["absoluteZoom"])
                 self.expected_pos = self.ptz_settled() or start
-        log.info("%s PTZ sweep: %d images (%s)", self.ip, n, "aimed at the road" if aimed else "no vanishing point — 1x/3x only")
+        self.no_road_streak = 0 if aimed else self.no_road_streak + 1
+        log.info("%s PTZ sweep: %d images (%s)", self.ip, n, "aimed at the road" if aimed else
+                 f"no vanishing point — 1x/3x only, {self.no_road_streak} in a row")
 
     def run(self):
         next_fixed = next_sweep = 0.0
@@ -372,6 +406,9 @@ class Camera:
             if not cfg["enabled"]:
                 time.sleep(30)
                 continue
+            if not self.detect_layout():
+                time.sleep(5)
+                continue
             now = time.time()
             if now >= next_fixed:
                 next_fixed = now + cfg["fixed_interval"]
@@ -379,8 +416,9 @@ class Camera:
             if now - last_operator_ptz() < cfg["operator_backoff"]:
                 self.expected_pos = None   # operator moved it; start fresh later
             elif self.has_ptz and now >= next_sweep and now >= self.backoff_until:
-                next_sweep = now + cfg["sweep_interval"]
                 self.sweep(cfg)
+                idle = self.no_road_streak >= cfg["idle_after"]
+                next_sweep = time.time() + cfg["idle_sweep_interval" if idle else "sweep_interval"]
             time.sleep(0.5)
 
 

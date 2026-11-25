@@ -20,6 +20,12 @@ import cv2
 import numpy as np
 
 
+def thumb_jpeg(jpeg: bytes):
+    """64x36 grayscale float thumbnail (decoded at 1/8 scale — cheap), or None."""
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_REDUCED_GRAYSCALE_8)
+    return None if img is None else cv2.resize(img, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
 def vanishing_point_jpeg(jpeg: bytes):
     """(x, y, confidence) in 0..1 image coordinates, or None."""
     img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
