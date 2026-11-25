@@ -74,7 +74,11 @@ def repair_modem_gps() -> None:
         log.error("Cannot write %s, skipping GPS repair to avoid a restart loop: %s", _REPAIR_MARKER, e)
         return
 
-    script = os.path.join(SCRIPT_DIR, "fix-modem-gps.py")
+    # Root-owned copy installed by provision-device.sh; the in-repo path is
+    # the fallback for devices set up with the older setup-sudo-restart.sh.
+    script = "/usr/local/lib/roadshield/fix-modem-gps.py"
+    if not os.path.exists(script):
+        script = os.path.join(SCRIPT_DIR, "fix-modem-gps.py")
     log.warning("No NMEA from the modem — running %s (internet drops ~30s, service restarts)", script)
     try:
         result = subprocess.run(
@@ -86,7 +90,7 @@ def repair_modem_gps() -> None:
         return
     if result.returncode != 0:
         log.error(
-            "GPS repair failed (exit %d): %s — run `sudo ./setup-sudo-restart.sh` once on this device",
+            "GPS repair failed (exit %d): %s — run `sudo ./provision-device.sh` once on this device",
             result.returncode, (result.stderr or result.stdout).strip()[-300:],
         )
 

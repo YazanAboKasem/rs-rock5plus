@@ -16,6 +16,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ─── Self-update: run the same code as every other device (see self-update.sh)
+if [[ -z "${RS_UPDATED:-}" && -x "$SCRIPT_DIR/self-update.sh" ]]; then
+    UPDATE_RC=0
+    "$SCRIPT_DIR/self-update.sh" || UPDATE_RC=$?
+    if [[ $UPDATE_RC -eq 10 ]]; then
+        export RS_UPDATED=1
+        exec "$SCRIPT_DIR/connect-to-server.sh" "$@"
+    fi
+fi
+
 # =============================================================================
 # ▼  CONFIG — عدّل هذه القيم فقط عند تغيير السيرفر  ▼
 # =============================================================================
