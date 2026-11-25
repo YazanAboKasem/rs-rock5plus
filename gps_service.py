@@ -28,6 +28,68 @@ import os
 
 log = logging.getLogger("gps-service")
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# No NMEA bytes at all for this long means the GNSS engine is off (an engine
+# that is on but has no satellite fix still emits empty sentences every second).
+NMEA_SILENCE_SECONDS = 30
+# A fix older than this is not reported, so a lost fix doesn't keep sending the
+# last position to the dashboard as if it were current.
+FIX_MAX_AGE_SECONDS = 30
+
+_REPAIR_MARKER = os.path.expanduser("~/.roadshield/gps_repair_boot")
+
+
+def _boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def repair_modem_gps() -> None:
+    """
+    Last resort when the modem's GNSS engine stays off even after
+    enable_modem_gps() reported success: `mmcli --location-enable-gps-unmanaged`
+    returns 0 on some EC25 firmware without actually running AT+QGPS=1, so no
+    NMEA ever arrives. fix-modem-gps.py writes autogps=1 into the modem's NVRAM
+    and starts the engine, so after one run GPS comes up on its own on every
+    boot. It briefly stops ModemManager (internet drops ~30s) and restarts this
+    service, so it runs at most once per boot; the sudoers rule comes from
+    setup-sudo-restart.sh.
+    """
+    boot = _boot_id()
+    try:
+        with open(_REPAIR_MARKER) as f:
+            if boot and f.read().strip() == boot:
+                return
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(_REPAIR_MARKER), exist_ok=True)
+        with open(_REPAIR_MARKER, "w") as f:
+            f.write(boot)
+    except OSError as e:
+        log.error("Cannot write %s, skipping GPS repair to avoid a restart loop: %s", _REPAIR_MARKER, e)
+        return
+
+    script = os.path.join(SCRIPT_DIR, "fix-modem-gps.py")
+    log.warning("No NMEA from the modem — running %s (internet drops ~30s, service restarts)", script)
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "/usr/bin/python3", script],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:
+        log.error("GPS repair failed to run: %s", e)
+        return
+    if result.returncode != 0:
+        log.error(
+            "GPS repair failed (exit %d): %s — run `sudo ./setup-sudo-restart.sh` once on this device",
+            result.returncode, (result.stderr or result.stdout).strip()[-300:],
+        )
+
 
 def _enable_via_modemmanager(retries: int, delay: float) -> bool:
     """
@@ -225,19 +287,22 @@ class GpsReader(threading.Thread):
     and keeps the latest GPS position updated.
     """
 
-    def __init__(self, port: str = "/dev/ttyTHS1", baudrate: int = 9600, on_open=None):
+    def __init__(self, port: str = "/dev/ttyTHS1", baudrate: int = 9600, on_open=None, on_silence=None):
         """
         port may be a glob (e.g. /dev/serial/by-id/usb-Quectel_*-if01-port0);
         it is re-resolved on every (re)open so a swapped modem with a different
         serial number is picked up without restarting.
         on_open, if given, is called before each (re)open — used to re-enable
         a modem's GNSS engine, which turns off whenever the modem resets.
+        on_silence, if given, is called when the port stays completely silent
+        for NMEA_SILENCE_SECONDS (engine off), before the port is reopened.
         """
         super().__init__()
         self.daemon = True
         self.port = port
         self.baudrate = baudrate
         self.on_open = on_open
+        self.on_silence = on_silence
         self.running = False
 
         self._latitude = None
@@ -284,6 +349,7 @@ class GpsReader(threading.Thread):
             stopbits=serial.STOPBITS_ONE,
         ) as ser:
             log.info("GPS serial port opened: %s", port)
+            last_data = time.time()
 
             while self.running:
                 try:
@@ -292,7 +358,13 @@ class GpsReader(threading.Thread):
                     continue
 
                 if not line:
+                    if time.time() - last_data > NMEA_SILENCE_SECONDS:
+                        log.warning("No NMEA on %s for %ds — GNSS engine looks off", port, NMEA_SILENCE_SECONDS)
+                        if self.on_silence:
+                            self.on_silence()
+                        raise TimeoutError("NMEA silent")
                     continue
+                last_data = time.time()
 
                 # Parse GGA sentences
                 if line.startswith('$GNGGA') or line.startswith('$GPGGA'):
@@ -336,8 +408,10 @@ class GpsReader(threading.Thread):
         self.running = False
 
     def get_position(self) -> tuple[float | None, float | None]:
-        """Return (latitude, longitude) or (None, None) if no fix."""
+        """Return (latitude, longitude), or (None, None) if there is no recent fix."""
         with self._lock:
+            if time.time() - self._last_update > FIX_MAX_AGE_SECONDS:
+                return None, None
             return self._latitude, self._longitude
 
     def get_full_data(self) -> dict:
@@ -351,7 +425,8 @@ class GpsReader(threading.Thread):
                 'satellites': self._satellites,
                 'fix_quality': self._fix_quality,
                 'last_update': self._last_update,
-                'has_fix': self._latitude is not None and self._longitude is not None,
+                'has_fix': (self._latitude is not None and self._longitude is not None
+                            and time.time() - self._last_update <= FIX_MAX_AGE_SECONDS),
             }
 
 

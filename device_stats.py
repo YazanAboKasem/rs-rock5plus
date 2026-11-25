@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 import requests
 
 from device_identity import get_device_id
-from gps_service import GpsReader, enable_modem_gps
+from gps_service import GpsReader, enable_modem_gps, repair_modem_gps
 
 try:
     import psutil
@@ -86,7 +86,9 @@ if GPS_PORT:
     # Re-enable the modem's GNSS engine on every (re)open, not just once at
     # startup — it turns off whenever the modem resets or is swapped.
     on_open = (lambda: enable_modem_gps(GPS_AT_PORT, GPS_AT_BAUD)) if GPS_AT_PORT else None
-    GPS_READER = GpsReader(GPS_PORT, GPS_BAUD, on_open=on_open)
+    # If the engine still stays off (no NMEA at all), fix the modem config once.
+    on_silence = repair_modem_gps if GPS_AT_PORT else None
+    GPS_READER = GpsReader(GPS_PORT, GPS_BAUD, on_open=on_open, on_silence=on_silence)
     GPS_READER.start()
 
 # ─── Logging ────────────────────────────────────────────────────────────────

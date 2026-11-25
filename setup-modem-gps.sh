@@ -6,7 +6,7 @@
 # turns on and no coordinates reach the server.
 set -e
 
-SERVICE_USER="${1:-q8b7}"
+SERVICE_USER="${1:-${SUDO_USER:?pass the service user, e.g. sudo $0 q8b7}}"
 RULE=/etc/polkit-1/rules.d/50-roadshield-modemmanager.rules
 
 if [[ $EUID -ne 0 ]]; then
