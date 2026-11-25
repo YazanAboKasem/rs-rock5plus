@@ -20,3 +20,4 @@ ai/ppe_crop_test/
 ai/ppe_test_output/
 *.pt
 .upload-tmp/
+dataset/

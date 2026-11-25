@@ -51,6 +51,7 @@ TUNNEL_PID=""
 CAMERA_CTRL_PID=""
 REC_CLEANUP_PID=""
 DEVICE_STATS_PID=""
+COLLECTOR_PID=""
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
@@ -113,6 +114,7 @@ cleanup() {
     echo ""
     log "إيقاف النظام..."
     clear_tunnel
+    [[ -n "$COLLECTOR_PID" ]] && kill "$COLLECTOR_PID" 2>/dev/null && log "data_collector.py متوقف."
     [[ -n "$DEVICE_STATS_PID" ]] && kill "$DEVICE_STATS_PID" 2>/dev/null && log "device_stats.py متوقف."
     [[ -n "$REC_CLEANUP_PID" ]] && kill "$REC_CLEANUP_PID" 2>/dev/null && log "recording-cleanup.py متوقف."
     [[ -n "$CAMERA_CTRL_PID" ]] && kill "$CAMERA_CTRL_PID" 2>/dev/null && log "camera-control.py متوقف."
@@ -214,6 +216,13 @@ else
     warn "camera-control.py غير موجود أو python3 غير متاح — PTZ غير مفعّل."
 fi
 echo ""
+
+# ─── 1b2. Start data_collector.py (training images, stored locally) ──────────
+if command -v python3 &>/dev/null && [[ -f "data_collector.py" ]]; then
+    log "تشغيل data_collector.py (جمع صور التدريب)..."
+    python3 data_collector.py > /tmp/data-collector.log 2>&1 &
+    COLLECTOR_PID=$!
+fi
 
 # ─── 1c. Start recording-cleanup.py (recording disk management) ──────────────
 if command -v python3 &>/dev/null && [[ -f "recording-cleanup.py" ]]; then
