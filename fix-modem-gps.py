@@ -60,6 +60,10 @@ def configure():
         at(ser, 'AT+QGPSCFG="autogps"')
 
         print("\n--- applying ---", flush=True)
+        # QGPSCFG changes are refused with "+CME ERROR: 504" while a GNSS
+        # session is running, so stop it first ("505" = it wasn't running).
+        at(ser, "AT+QGPSEND")
+        time.sleep(1)
         at(ser, 'AT+QGPSCFG="outport","usbnmea"')
         at(ser, 'AT+QGPSCFG="nmeasrc",1')
         at(ser, 'AT+QGPSCFG="gpsnmeatype",31')
@@ -69,6 +73,8 @@ def configure():
         print("\n--- after ---", flush=True)
         at(ser, "AT+QGPS?")
         at(ser, 'AT+QGPSCFG="outport"')
+        if '"autogps",1' not in at(ser, 'AT+QGPSCFG="autogps"'):
+            print("WARNING: autogps was not saved — GPS will be off after the next power cycle", flush=True)
         at(ser, "AT+QGPSLOC=2")  # "+CME ERROR: 516" = no fix yet
 
     nmea = sorted(glob.glob("/dev/serial/by-id/usb-Quectel_*-if01-port0"))
