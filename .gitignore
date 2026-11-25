@@ -21,3 +21,4 @@ ai/ppe_test_output/
 *.pt
 .upload-tmp/
 dataset/
+.pylib/

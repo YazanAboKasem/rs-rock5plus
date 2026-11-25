@@ -66,6 +66,15 @@ chown "$SERVICE_USER:$(id -gn "$SERVICE_USER")" "$AK"
 chmod 600 "$AK"
 echo "✓ server key in $AK"
 
+# ── 3b. image libraries for data_collector.py (road vanishing point) ────────
+# NEEDRESTART_MODE=l: list only — needrestart would otherwise restart sshd /
+# services mid-install and cut the session running this script.
+if ! python3 -c "import cv2, numpy" 2>/dev/null; then
+    echo "Installing python3-opencv (large download over cellular)..."
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -q python3-opencv python3-numpy >/tmp/provision-apt.log 2>&1 \
+        && echo "✓ python3-opencv" || echo "! python3-opencv install failed, see /tmp/provision-apt.log"
+fi
+
 # ── 4. modem GPS (saved in the modem; restarts the service when done) ────────
 if ls /dev/serial/by-id/usb-Quectel_*-if02-port0 >/dev/null 2>&1; then
     echo "Configuring modem GPS (internet drops ~30s)..."

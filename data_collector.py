@@ -10,9 +10,15 @@ device.
 Per TandemVu camera (one IP, two lenses):
   • Fixed (wide) lens  — a snapshot every FIXED_INTERVAL seconds, skipped when
     the scene clearly hasn't changed (parked car).
-  • PTZ (zoom) lens    — every SWEEP_INTERVAL seconds a sweep over a grid of
-    pan offsets × zoom levels around where the PTZ currently points, one
-    snapshot per position, then the PTZ goes back to where it was.
+  • PTZ (zoom) lens    — every sweep_interval seconds a sweep aimed at the
+    road: a 1x shot, the road's vanishing point found in it (lane lines
+    converging, see road_geometry.py), the PTZ turned onto that point and
+    re-checked at 3x, then 6x/12x/25x shots down the road with offsets that
+    shrink as the field of view narrows; then the PTZ goes back where it
+    was. The far end of the road is where a taper, distant cones and
+    approaching traffic are, and the frame centre often is not on the road.
+    Without OpenCV, or when no vanishing point is found, only the 1x/3x
+    shots are taken (higher zoom on an unknown target mostly frames trees).
 
 Snapshots come straight from the camera (ISAPI .../picture), so no video is
 decoded here and recording/streaming are untouched.
@@ -31,10 +37,12 @@ Settings can be overridden in ~/.roadshield/collector.json, e.g.
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -43,6 +51,38 @@ import requests
 from requests.auth import HTTPDigestAuth
 
 from device_identity import get_device_id
+
+# OpenCV + numpy for road_geometry.py live in a project-local folder
+# (pip --target, ~55 MB of wheels instead of ~150 MB of apt packages over
+# cellular, no sudo); installed on first run by ensure_image_libs().
+PYLIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pylib")
+sys.path.insert(0, PYLIB)
+vanishing_point_jpeg = None
+
+
+def load_image_libs() -> bool:
+    global vanishing_point_jpeg
+    if vanishing_point_jpeg is None:
+        try:
+            from road_geometry import vanishing_point_jpeg as vp
+            vanishing_point_jpeg = vp
+        except Exception:
+            return False
+    return True
+
+
+def ensure_image_libs():
+    """Background: pip-install OpenCV/numpy into .pylib if missing."""
+    if load_image_libs():
+        return
+    log.info("Installing opencv-python-headless + numpy into %s (one-time download)", PYLIB)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", PYLIB,
+                        "--break-system-packages", "--no-warn-script-location",
+                        "opencv-python-headless", "numpy"], capture_output=True, text=True, timeout=1800)
+    if r.returncode == 0 and load_image_libs():
+        log.info("Image libraries ready — sweeps now aim at the road")
+    else:
+        log.warning("Image library install failed (%s) — sweeps stay at 1x/3x", (r.stderr or r.stdout).strip()[-200:])
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(SCRIPT_DIR, "dataset")
@@ -53,10 +93,19 @@ DEFAULTS = {
     "enabled": True,
     "fixed_interval": 5,          # s between fixed-lens snapshots
     "fixed_keep_every": 300,      # s — keep one even if the scene looks unchanged
-    "sweep_interval": 300,        # s between PTZ sweeps
-    "pan_offsets": [-40, -20, 0, 20, 40],   # degrees around the current heading
-    "zoom_levels": [1, 4, 12],    # optical zoom factors
+    "sweep_interval": 180,        # s between PTZ sweeps
+    # [optical zoom, [pan offsets °], [tilt offsets °, + = down]] around the
+    # road's vanishing point. The field of view narrows with zoom (~58° at
+    # 1x, ~2.4° at 25x) so offsets shrink with it. At 12x/25x a frame centred
+    # exactly on the vanishing point is half sky and lamp posts; tilted
+    # slightly down it fills with the road short of the far end — cones,
+    # arrow boards and approaching cars (checked on a live work zone).
+    "sweep_plan": [[3, [-6, 0, 6], [0]], [6, [-3, 0, 3], [0.6]],
+                   [12, [-1.5, 0, 1.5], [0.4, 1.3]], [25, [-0.7, 0, 0.7], [0.25, 0.8]]],
+    "hfov_1x": 57.6,              # horizontal field of view at 1x (degrees)
+    "vp_min_conf": 0.45,          # vanishing-point confidence needed to zoom past 3x
     "settle": 3.0,                # s to wait after a move (motion + autofocus)
+    "settle_long_zoom": 5.0,      # s at 12x and above (longer focus travel)
     "operator_backoff": 900,      # s to pause sweeps after a manual PTZ move
     "min_free_gb": 50,            # stop writing below this much free disk
     "max_per_day": 6000,          # per camera per lens
@@ -191,33 +240,87 @@ class Camera:
             self.last_kept["fixed"] = now
 
     # ── PTZ sweep ──
+    def ptz_settled(self, timeout=20.0) -> dict | None:
+        """Status once two reads 1s apart agree (a zoom from 25x to 1x takes
+        several seconds; reading mid-move would look like an operator)."""
+        last, t_end = None, time.time() + timeout
+        while time.time() < t_end:
+            cur = self.ptz_status()
+            if cur and cur == last:
+                return cur
+            last = cur
+            time.sleep(1.0)
+        return last
+
+    @staticmethod
+    def same_pos(a: dict, b: dict) -> bool:
+        d_az = abs((a["azimuth"] - b["azimuth"] + 1800) % 3600 - 1800)
+        return d_az <= 5 and abs(a["elevation"] - b["elevation"]) <= 5 and abs(a["absoluteZoom"] - b["absoluteZoom"]) <= 3
+
+    @staticmethod
+    def frame_to_angles(x: float, y: float, zoom: float, cfg: dict, aspect: float = 1440 / 2560):
+        """Offset (pan°, tilt° + = down) of image point (x, y) from the centre."""
+        th = math.tan(math.radians(cfg["hfov_1x"] / 2)) / zoom
+        tv = th * aspect
+        return (math.degrees(math.atan((x - 0.5) * 2 * th)),
+                math.degrees(math.atan((y - 0.5) * 2 * tv)))
+
+    def shot(self, az: int, el: int, zoom: float, cfg: dict, extra: dict | None = None):
+        z = int(round(zoom * 10))
+        if not self.ptz_goto(az, el, z):
+            return None
+        time.sleep(cfg["settle_long_zoom"] if zoom >= 12 else cfg["settle"])
+        jpeg = self.snapshot(PTZ_CHANNEL)
+        if not jpeg:
+            return None
+        vp = vanishing_point_jpeg(jpeg) if zoom <= 3 and load_image_libs() else None
+        meta = {"ptz": {"azimuth": az % 3600, "elevation": el, "zoom": z}}
+        if vp:
+            meta["vanishing_point"] = {"x": round(vp[0], 4), "y": round(vp[1], 4), "conf": round(vp[2], 2)}
+        meta.update(extra or {})
+        saved = self.save("ptz", jpeg, meta, cfg)
+        return vp, saved
+
     def sweep(self, cfg: dict):
-        start = self.ptz_status()
+        start = self.ptz_settled(timeout=5)
         if not start:
             return
-        if self.expected_pos and start != self.expected_pos:
+        if self.expected_pos and not self.same_pos(start, self.expected_pos):
             log.info("%s PTZ was moved by someone else — pausing sweeps for %ds", self.ip, cfg["operator_backoff"])
             self.backoff_until = time.time() + cfg["operator_backoff"]
             self.expected_pos = None
             return
-        n = 0
+        n, aimed = 0, False
         try:
-            for zoom in cfg["zoom_levels"]:
-                for pan in cfg["pan_offsets"]:
-                    if not running:
-                        return
-                    az, el, z = start["azimuth"] + pan * 10, start["elevation"], int(zoom * 10)
-                    if not self.ptz_goto(az, el, z):
-                        continue
-                    time.sleep(cfg["settle"])
-                    jpeg = self.snapshot(PTZ_CHANNEL)
-                    if jpeg and self.save("ptz", jpeg, {"ptz": {"azimuth": az % 3600, "elevation": el, "zoom": z}}, cfg):
-                        n += 1
+            az0, el0 = start["azimuth"], start["elevation"]
+            # 1x from the current heading, then aim at the road's far end
+            r = self.shot(az0, el0, 1, cfg, {"step": "overview"})
+            n += bool(r and r[1])
+            vp = r[0] if r else None
+            if vp and vp[2] >= cfg["vp_min_conf"]:
+                pan, tilt = self.frame_to_angles(vp[0], vp[1], 1, cfg)
+                az0, el0 = az0 + round(pan * 10), el0 + round(tilt * 10)
+                # re-check at 3x: corrects the FOV/lens model error up close
+                r = self.shot(az0, el0, 3, cfg, {"step": "aim"})
+                n += bool(r and r[1])
+                if r and r[0] and r[0][2] >= cfg["vp_min_conf"]:
+                    pan, tilt = self.frame_to_angles(r[0][0], r[0][1], 3, cfg)
+                    az0, el0 = az0 + round(pan * 10), el0 + round(tilt * 10)
+                    aimed = True
+            for zoom, pans, tilts in cfg["sweep_plan"]:
+                if zoom > 3 and not aimed:
+                    break
+                for tilt in tilts:
+                    for pan in pans:
+                        if not running:
+                            return
+                        r = self.shot(az0 + round(pan * 10), el0 + round(tilt * 10), zoom, cfg,
+                                      {"step": "road", "aimed": aimed})
+                        n += bool(r and r[1])
         finally:
             self.ptz_goto(start["azimuth"], start["elevation"], start["absoluteZoom"])
-            time.sleep(cfg["settle"])
-            self.expected_pos = self.ptz_status()
-        log.info("%s PTZ sweep: %d images", self.ip, n)
+            self.expected_pos = self.ptz_settled() or start
+        log.info("%s PTZ sweep: %d images (%s)", self.ip, n, "aimed at the road" if aimed else "no vanishing point — 1x/3x only")
 
     def run(self):
         next_fixed = next_sweep = 0.0
@@ -244,6 +347,7 @@ def main():
         return
     log.info("Collecting for %s into %s: %s", device, DATASET_DIR,
              ", ".join(f"{c['ip']} ({'+'.join(c['keys'])}{', PTZ' if c['has_ptz'] else ''})" for c in cams))
+    threading.Thread(target=ensure_image_libs, daemon=True).start()
     threads = [threading.Thread(target=Camera(c, device).run, daemon=True) for c in cams]
     for t in threads:
         t.start()
