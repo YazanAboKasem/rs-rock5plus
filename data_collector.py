@@ -11,19 +11,21 @@ Per TandemVu camera (one IP, two lenses):
   • Fixed (wide) lens  — a snapshot every FIXED_INTERVAL seconds, skipped when
     the scene clearly hasn't changed (parked car).
   • PTZ (zoom) lens    — every sweep_interval seconds a sweep aimed at the
-    road: a 1x shot, the road's vanishing point found in it (lane lines
-    converging, see road_geometry.py), the PTZ turned onto that point and
-    re-checked at 3x, then 6x/12x/25x shots down the road with offsets that
-    shrink as the field of view narrows; then the PTZ goes back where it
-    was. The far end of the road is where a taper, distant cones and
-    approaching traffic are, and the frame centre often is not on the road.
-    When a line of traffic cones is in the 1x frame (colour-based detection)
-    the sweep also zooms on the work zone: 4x on the middle of the cones,
-    8x on the farthest ones — the start of the taper — which also covers
-    curved roads and roundabouts where there is no vanishing point. Cone
-    boxes and the vanishing point are saved in index.jsonl as rough labels.
-    Without OpenCV, or with neither road nor cones in view, only the 1x/3x
-    shots are taken (higher zoom on an unknown target mostly frames trees).
+    road. The fixed lens always looks down the road behind the TMA, so its
+    vanishing point (lane lines converging, road_geometry.py), checked every
+    20 s and taken as the median of the last 10 min, is the target; the
+    zoom lens's 1x frame is matched to the fixed frame (SIFT, OSD masked)
+    to turn that point into PTZ angles. Fallback: the vanishing point in
+    the zoom lens's own 1x frame, refined at 3x. Then 6x/12x/25x shots down
+    the road with offsets that shrink as the field of view narrows, and the
+    PTZ goes back where it was.
+    When a line of traffic cones is in view (colour-based) the sweep also
+    zooms on the work zone: 4x on the middle of the cones, 8x on the
+    farthest ones — the start of the taper.
+    Frames with no detail and no cone colour (sky, walls, ceilings, noise at
+    long zoom at night) are not saved and stop the zoom ladder.
+  • Camera clocks are set from the car's clock when they drift > 10 s.
+  • Files are written temp → fsync → rename: the cars lose power abruptly.
 
 Snapshots come straight from the camera (ISAPI .../picture), so no video is
 decoded here and recording/streaming are untouched.
@@ -63,24 +65,27 @@ from device_identity import get_device_id
 # cellular, no sudo); installed on first run by ensure_image_libs().
 PYLIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pylib")
 sys.path.insert(0, PYLIB)
-vanishing_point_jpeg = None
-thumb_jpeg = None
-cones_jpeg = None
+RG = None          # road_geometry, once OpenCV/numpy import
+np = cv2 = None
 
 
 def load_image_libs() -> bool:
-    global vanishing_point_jpeg, thumb_jpeg, cones_jpeg
-    if vanishing_point_jpeg is None:
+    global RG, np, cv2
+    if RG is None:
         # .pylib may not have existed when Python first scanned sys.path, and
         # the path importer cache would keep reporting it empty after install.
         sys.path_importer_cache.pop(PYLIB, None)
         importlib.invalidate_caches()
         try:
-            from road_geometry import cones_jpeg as cj, thumb_jpeg as th, vanishing_point_jpeg as vp
-            vanishing_point_jpeg, thumb_jpeg, cones_jpeg = vp, th, cj
+            import road_geometry as rg
+            RG, np, cv2 = rg, rg.np, rg.cv2
         except Exception:
             return False
     return True
+
+
+def decode(jpeg: bytes):
+    return cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
 
 
 def ensure_image_libs():
@@ -126,6 +131,18 @@ DEFAULTS = {
     "hfov_1x": 55.1,
     "zoom_fov_exponent": 0.85,
     "vp_min_conf": 0.45,          # vanishing-point confidence needed to zoom past 3x
+    # Aiming from the fixed lens: its vanishing point is stable while driving
+    # (bolted to the car); keep confident ones from the last fixed_vp_window s
+    # and aim when at least fixed_vp_min of them agree.
+    "fixed_vp_conf": 0.4,
+    "fixed_vp_window": 600,
+    "fixed_vp_min": 4,
+    # Frames with less detail than this (road_geometry.texture) and no cone
+    # colour are not saved and stop the sweep zooming further: ceilings,
+    # walls up close, noise-only frames at long zoom at night score 1–3;
+    # a sharp cone on smooth asphalt with a blurred background can score 2,
+    # hence the cone-colour exemption.
+    "min_texture": 3.0,
     # Work-zone shots when a line of cones is in the 1x frame (colour-based,
     # road_geometry.cone_boxes): one at cone_centre_zoom on the middle of the
     # cones, then cone_zoom on each of the farthest far_cones — the start of
@@ -225,6 +242,12 @@ class Camera:
         self.layout_checked = 0.0
         self.no_road_streak = 0
         self.last_thumb = None
+        self.fixed_vps = []         # (time, x, y) confident vanishing points, fixed lens
+        self.fixed_cones = (0.0, [])
+        self.blank = 0
+        self.match_scale = None
+        self.clock_synced = 0.0
+        self.last_vp_check = 0.0
 
     # ── ISAPI ──
     def snapshot(self, channel: int) -> bytes | None:
@@ -292,14 +315,53 @@ class Camera:
         os.makedirs(folder, exist_ok=True)
         suffix = "".join(f"_{k[0]}{v}" for k, v in meta.get("ptz", {}).items()) if lens == "ptz" else ""
         fname = now.strftime("%H%M%S_%f")[:-3] + suffix + ".jpg"
-        with open(os.path.join(folder, fname), "wb") as f:
+        # The cars lose power abruptly at the end of a shift: write to a temp
+        # name, fsync, then rename, so a file is either whole or absent, and
+        # fsync the index line so it never ends in a block of NUL bytes.
+        path = os.path.join(folder, fname)
+        with open(path + ".part", "wb") as f:
             f.write(jpeg)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(path + ".part", path)
         record = {"file": fname, "time": now.isoformat(timespec="milliseconds"), "device": self.device,
                   "camera_ip": self.ip, "lens": lens, "bytes": len(jpeg), **meta}
         with open(os.path.join(folder, "index.jsonl"), "a") as f:
             f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         self.counts[key] = self.counts.get(key, 0) + 1
         return True
+
+    # ── camera clock ──
+    def sync_clock(self):
+        """Set the camera's clock from the car's (NTP over the modem) when
+        they differ by more than 10 s. Cameras have no internet, drift by
+        minutes, and one car's cameras were on 1970 — the time burnt into
+        every frame is evidence, so it has to be right."""
+        if dt.datetime.now().year < 2026:
+            return                      # car clock not set yet
+        url = f"http://{self.ip}/ISAPI/System/time"
+        try:
+            r = requests.get(url, auth=self.auth, timeout=TIMEOUT)
+            m_t = re.search(r"<localTime>([^<]+)</localTime>", r.text)
+            m_z = re.search(r"<timeZone>([^<]+)</timeZone>", r.text)
+            if r.status_code != 200 or not m_t:
+                return
+            cam = dt.datetime.fromisoformat(m_t.group(1)[:19])
+            drift = (cam - dt.datetime.now()).total_seconds()
+            if abs(drift) <= 10:
+                return
+            now = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            tz = m_z.group(1) if m_z else "CST-4:00:00"
+            xml = (f'<?xml version="1.0" encoding="UTF-8"?><Time><timeMode>manual</timeMode>'
+                   f"<localTime>{now}</localTime><timeZone>{tz}</timeZone></Time>")
+            r = requests.put(url, data=xml.encode(), headers={"Content-Type": "application/xml"},
+                             auth=self.auth, timeout=TIMEOUT)
+            log.info("%s camera clock was off by %+.0fs — set to %s (%s)", self.ip, drift, now,
+                     "ok" if r.status_code == 200 else f"HTTP {r.status_code}")
+        except (requests.RequestException, ValueError) as e:
+            log.debug("%s clock sync failed: %s", self.ip, e)
 
     # ── fixed lens ──
     def fixed_tick(self, cfg: dict):
@@ -307,19 +369,51 @@ class Camera:
         if not jpeg:
             return
         now = time.time()
-        thumb = thumb_jpeg(jpeg) if load_image_libs() else None
+        libs = load_image_libs()
+        thumb = RG.thumb_jpeg(jpeg) if libs else None
         if thumb is not None and self.last_thumb is not None:
             unchanged = float(abs(thumb - self.last_thumb).mean()) < cfg["fixed_diff"]
         else:
             # no OpenCV yet: same scene → near-identical JPEG size
             last = self.last_size.get("fixed")
             unchanged = bool(last) and abs(len(jpeg) - last) / last < 0.015
-        if unchanged and now - self.last_kept.get("fixed", 0) < cfg["fixed_keep_every"]:
+        keep = not unchanged or now - self.last_kept.get("fixed", 0) >= cfg["fixed_keep_every"]
+        if not keep and not (libs and self.has_ptz and now - self.last_vp_check >= 20):
             return
-        if self.save("fixed", jpeg, {}, cfg):
+        meta = {}
+        if libs and self.has_ptz:
+            self.last_vp_check = now
+            # The fixed lens always looks down the road behind the TMA: its
+            # vanishing point and cones are what the zoom lens is aimed at.
+            img = decode(jpeg)
+            if img is not None:
+                r = RG.vanishing_point(img)
+                cones = RG.cone_boxes(img)
+                if r:
+                    meta["vanishing_point"] = {"x": round(r[0], 4), "y": round(r[1], 4), "conf": round(r[2], 2)}
+                    if r[2] >= cfg["fixed_vp_conf"]:
+                        self.fixed_vps.append((now, r[0], r[1]))
+                if cones:
+                    meta["cone_boxes"] = [[round(v, 4) for v in b] for b in cones]
+                self.fixed_cones = (now, cones)
+        if keep and self.save("fixed", jpeg, meta, cfg):
             self.last_size["fixed"] = len(jpeg)
             self.last_kept["fixed"] = now
             self.last_thumb = thumb
+
+    def road_from_fixed(self, cfg: dict):
+        """Median of the fixed lens's recent confident vanishing points, if
+        they agree (the lens is bolted to the car, so on a straight road the
+        point barely moves). None when parked off-road, on curves, in yards."""
+        cutoff = time.time() - cfg["fixed_vp_window"]
+        self.fixed_vps = [v for v in self.fixed_vps if v[0] >= cutoff][-60:]
+        if len(self.fixed_vps) < cfg["fixed_vp_min"]:
+            return None
+        xs = sorted(v[1] for v in self.fixed_vps)
+        ys = sorted(v[2] for v in self.fixed_vps)
+        mx, my = xs[len(xs) // 2], ys[len(ys) // 2]
+        near = sum(1 for _, x, y in self.fixed_vps if abs(x - mx) < 0.05 and abs(y - my) < 0.05)
+        return (mx, my) if near >= 0.6 * len(self.fixed_vps) else None
 
     # ── PTZ sweep ──
     def ptz_settled(self, timeout=20.0) -> dict | None:
@@ -351,7 +445,9 @@ class Camera:
         pass
 
     def shot(self, az: int, el: int, zoom: float, cfg: dict, extra: dict | None = None) -> dict | None:
-        """Move, settle, snapshot, save. Returns {"vp", "cones", "saved"} or None."""
+        """Move, settle, snapshot, save. Returns {"vp", "cones", "saved",
+        "blank", "img"} or None. Frames with no detail (sky, a wall up close,
+        noise-only night frames at long zoom) are not saved."""
         if last_operator_ptz() >= self.sweep_started:
             raise self.OperatorTookOver()
         z = int(round(zoom * 10))
@@ -361,16 +457,59 @@ class Camera:
         jpeg = self.snapshot(PTZ_CHANNEL)
         if not jpeg:
             return None
-        libs = zoom <= 3 and load_image_libs()
-        vp = vanishing_point_jpeg(jpeg) if libs else None
-        cones = cones_jpeg(jpeg) if libs and zoom == 1 else []
+        libs = load_image_libs()
+        img = decode(jpeg) if libs else None
         meta = {"ptz": {"azimuth": az % 3600, "elevation": el, "zoom": z}}
+        vp, cones, tex = None, [], None
+        if img is not None:
+            tex = RG.texture(img)
+            meta["texture"] = round(tex, 1)
+            if tex < cfg["min_texture"] and RG.cone_colour(img) < 0.002:
+                self.blank += 1
+                return {"vp": None, "cones": [], "saved": False, "blank": True, "img": img}
+            if zoom <= 3:
+                r = RG.vanishing_point(img)
+                vp = r[:3] if r else None
+            if zoom == 1:
+                cones = RG.cone_boxes(img)
         if vp:
             meta["vanishing_point"] = {"x": round(vp[0], 4), "y": round(vp[1], 4), "conf": round(vp[2], 2)}
         if cones:
             meta["cone_boxes"] = [[round(v, 4) for v in b] for b in cones]
         meta.update(extra or {})
-        return {"vp": vp, "cones": cones, "saved": self.save("ptz", jpeg, meta, cfg)}
+        return {"vp": vp, "cones": cones, "saved": self.save("ptz", jpeg, meta, cfg), "blank": False, "img": img}
+
+    def fixed_to_ptz(self, ptz_img, cfg: dict):
+        """Function (u, v) in the fixed lens's frame → (pan°, tilt°) offset
+        from where the zoom lens points now (at 1x), from matching the two
+        lenses' images; None when they don't match."""
+        fjpeg = self.snapshot(self.fixed_channel)
+        fimg = decode(fjpeg) if fjpeg else None
+        if fimg is None or ptz_img is None:
+            return None, None
+        A, n = RG.match_lenses(fimg, ptz_img)
+        if A is None:
+            log.debug("%s lens match failed (%d matches)", self.ip, n)
+            return None, fimg
+        scale = math.hypot(A[0, 0], A[1, 0])        # zoom-frame px → fixed px
+        if not 0.3 < scale < 0.9:                    # zoom 1x is ~0.5–0.65 of the fixed view
+            log.debug("%s lens match implausible (scale %.2f)", self.ip, scale)
+            return None, fimg
+        Ai = cv2.invertAffineTransform(A)
+        W = 960
+        fh = fimg.shape[0] * W / fimg.shape[1]
+        ph = ptz_img.shape[0] * W / ptz_img.shape[1]
+
+        def to_angles(u, v, margin=0.05):
+            """None outside the zoom lens's 1x view: the fixed lens is very
+            wide and distorted, so the match only holds where they overlap."""
+            x, y = Ai @ np.array([u * W, v * fh, 1.0])
+            x, y = x / W, y / ph
+            if not (-margin <= x <= 1 + margin and -margin <= y <= 1 + margin):
+                return None
+            return self.frame_to_angles(x, y, 1, cfg)
+        self.match_scale = scale
+        return to_angles, fimg
 
     def sweep(self, cfg: dict):
         start = self.ptz_settled(timeout=5)
@@ -382,34 +521,55 @@ class Camera:
             self.backoff_until = time.time() + cfg["operator_backoff"]
             self.expected_pos = None
             return
-        n, aimed, n_cones, restore = 0, False, 0, True
+        n, aimed, n_cones, restore, how = 0, False, 0, True, ""
+        self.blank = 0
         self.sweep_started = time.time() - 1
         try:
             az1, el1 = start["azimuth"], start["elevation"]
             # 1x from the current heading
             r = self.shot(az1, el1, 1, cfg, {"step": "overview"})
             n += bool(r and r["saved"])
-            vp = r["vp"] if r else None
+            vp = r["vp"] if r and not r["blank"] else None
             cones = r["cones"] if r else []
+            to_angles, fimg = self.fixed_to_ptz(r["img"], cfg) if r and r["img"] is not None else (None, None)
 
-            # work zone: zoom on the cones themselves (also on curved roads)
+            # work zone: zoom on the cones themselves (also on curved roads).
+            # The fixed lens sees more of the road than the zoom lens at 1x,
+            # so its cones are used when the two lenses' images match.
+            targets, pts = [], []
+            if cones:
+                pts = [self.frame_to_angles(b[0] + b[2] / 2, b[1] + b[3] / 2, 1, cfg) for b in cones]
+            elif to_angles and fimg is not None:
+                # cones the fixed lens sees inside the zoom lens's view (the
+                # zoom lens's own detection missed them: small at night)
+                fc = [(b, to_angles(b[0] + b[2] / 2, b[1] + b[3] / 2)) for b in RG.cone_boxes(fimg)]
+                fc = [(b, a) for b, a in fc if a]
+                if len(fc) >= 3:
+                    cones, pts, how = [b for b, _ in fc], [a for _, a in fc], "fixed"
             if cones:
                 n_cones = len(cones)
-                cx = sum(b[0] + b[2] / 2 for b in cones) / len(cones)
-                cy = sum(b[1] + b[3] / 2 for b in cones) / len(cones)
-                targets = [(cx, cy, cfg["cone_centre_zoom"], "cones_centre")]
-                targets += [(b[0] + b[2] / 2, b[1] + b[3] / 2, cfg["cone_zoom"], "far_cone")
-                            for b in cones[:cfg["far_cones"]]]
-                for x, y, zoom, step in targets:
-                    if not running:
-                        return
-                    pan, tilt = self.frame_to_angles(x, y, 1, cfg)
-                    r = self.shot(az1 + round(pan * 10), el1 + round(tilt * 10), zoom, cfg, {"step": step})
-                    n += bool(r and r["saved"])
+                cpan = sum(p[0] for p in pts) / len(pts)
+                ctilt = sum(p[1] for p in pts) / len(pts)
+                targets = [(cpan, ctilt, cfg["cone_centre_zoom"], "cones_centre")]
+                targets += [(p[0], p[1], cfg["cone_zoom"], "far_cone") for p in pts[:cfg["far_cones"]]]
+            for pan, tilt, zoom, step in targets:
+                if not running:
+                    return
+                r = self.shot(az1 + round(pan * 10), el1 + round(tilt * 10), zoom, cfg,
+                              {"step": step, "aim": how or "ptz"})
+                n += bool(r and r["saved"])
 
-            # far end of the road: aim at the vanishing point, refine at 3x
+            # far end of the road. Best: the fixed lens's stable vanishing
+            # point, mapped onto the zoom lens. Fallback: the vanishing point
+            # in the zoom lens's own 1x frame, refined at 3x.
             az0, el0 = az1, el1
-            if vp and vp[2] >= cfg["vp_min_conf"]:
+            road = self.road_from_fixed(cfg) if to_angles else None
+            road = to_angles(*road) if road else None
+            if road:
+                pan, tilt = road
+                az0, el0 = az1 + round(pan * 10), el1 + round(tilt * 10)
+                aimed, aim_by = True, "fixed"
+            elif vp and vp[2] >= cfg["vp_min_conf"]:
                 pan, tilt = self.frame_to_angles(vp[0], vp[1], 1, cfg)
                 az0, el0 = az1 + round(pan * 10), el1 + round(tilt * 10)
                 r = self.shot(az0, el0, 3, cfg, {"step": "aim"})
@@ -417,17 +577,21 @@ class Camera:
                 if r and r["vp"] and r["vp"][2] >= cfg["vp_min_conf"]:
                     pan, tilt = self.frame_to_angles(r["vp"][0], r["vp"][1], 3, cfg)
                     az0, el0 = az0 + round(pan * 10), el0 + round(tilt * 10)
-                    aimed = True
+                    aimed, aim_by = True, "ptz"
             for zoom, pans, tilts in cfg["sweep_plan"]:
                 if zoom > 3 and not aimed:
                     break
+                level_ok = False
                 for tilt in tilts:
                     for pan in pans:
                         if not running:
                             return
                         r = self.shot(az0 + round(pan * 10), el0 + round(tilt * 10), zoom, cfg,
-                                      {"step": "road", "aimed": aimed})
+                                      {"step": "road", "aimed": aimed, **({"aim": aim_by} if aimed else {})})
                         n += bool(r and r["saved"])
+                        level_ok |= bool(r and not r["blank"])
+                if not level_ok:
+                    break        # nothing but blank frames: more zoom won't help
         except self.OperatorTookOver:
             # leave the PTZ where the operator is putting it
             restore = False
@@ -442,7 +606,9 @@ class Camera:
                 self.expected_pos = self.ptz_settled() or start
         found_road = aimed or n_cones > 0
         self.no_road_streak = 0 if found_road else self.no_road_streak + 1
-        parts = (["aimed at the road"] if aimed else []) + ([f"{n_cones} cones zoomed"] if n_cones else [])
+        parts = ([f"aimed at the road ({aim_by} lens)"] if aimed else []) + \
+                ([f"{n_cones} cones zoomed ({how or 'ptz'} lens)"] if n_cones else []) + \
+                ([f"{self.blank} blank skipped"] if self.blank else [])
         log.info("%s PTZ sweep: %d images (%s)", self.ip, n, ", ".join(parts) if parts else
                  f"no road or cones found — 1x/3x only, {self.no_road_streak} in a row")
 
@@ -457,6 +623,9 @@ class Camera:
                 time.sleep(5)
                 continue
             now = time.time()
+            if now - self.clock_synced > 3600:
+                self.clock_synced = now
+                self.sync_clock()
             if now >= next_fixed:
                 next_fixed = now + cfg["fixed_interval"]
                 self.fixed_tick(cfg)

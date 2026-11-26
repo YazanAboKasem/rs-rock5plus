@@ -51,7 +51,7 @@ def vanishing_point(img):
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 50, 150)
     edges[: int(H * 0.30)] = 0  # sky / skyline / OSD timestamp
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=W // 25, maxLineGap=12)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=W // 12, maxLineGap=12)
     if lines is None:
         return None
     segs = []
@@ -68,7 +68,7 @@ def vanishing_point(img):
     p2 = np.c_[segs[:, 2], segs[:, 3], np.ones(len(segs))]
     L = np.cross(p1, p2)
     L /= np.linalg.norm(L[:, :2], axis=1, keepdims=True)
-    wts = segs[:, 4]
+    wts = segs[:, 4] ** 2   # long lines (lane markings, kerbs) outvote grass/gravel texture
     rng = np.random.default_rng(0)
     best, best_score = None, 0
     tol = W * 0.012
@@ -92,7 +92,65 @@ def vanishing_point(img):
     A, b = L[inl, :2], -L[inl, 2]
     sol, *_ = np.linalg.lstsq(A * wts[inl, None], b * wts[inl], rcond=None)
     conf = float(wts[inl].sum() / wts.sum())
+    # A road's edges and lane lines converge from both sides: lines on the left
+    # of the vanishing point lean one way, on the right the other. Ceiling
+    # tiles, fences, tarps and building facades give one family of parallel
+    # lines instead. Score the weaker side; < ~0.2 is not a road.
+    slope = (segs[inl, 3] - segs[inl, 1]) / np.where(segs[inl, 2] == segs[inl, 0], 1e-6, segs[inl, 2] - segs[inl, 0])
+    w_in = wts[inl]
+    neg, pos = w_in[slope < 0].sum(), w_in[slope > 0].sum()
+    two_sided = float(min(neg, pos) / max(neg + pos, 1e-6))
+    conf *= min(1.0, two_sided / 0.2)
     return float(sol[0] / W), float(sol[1] / H), conf, segs, inl, scale
+
+
+def texture(img) -> float:
+    """Detail in a frame: std of the Laplacian on a 640px-wide grey copy.
+    Blank sky, a wall or ceiling up close, an out-of-focus or noise-only night
+    frame at long zoom score < ~6; a street scene scores 15+."""
+    g = cv2.cvtColor(cv2.resize(img, (640, int(img.shape[0] * 640 / img.shape[1]))), cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    h = g.shape[0]
+    return float(cv2.Laplacian(g[int(h * 0.09): int(h * 0.9)], cv2.CV_32F).std())
+
+
+def cone_colour(img) -> float:
+    """Fraction of the frame in traffic-cone orange/red (0..1)."""
+    small = cv2.resize(img, (320, int(img.shape[0] * 320 / img.shape[1])))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, (0, 110, 90), (14, 255, 255)) | cv2.inRange(hsv, (165, 110, 90), (180, 255, 255))
+    return float(m.mean() / 255)
+
+
+def match_lenses(fixed, ptz, min_inliers=15):
+    """Where the zoom lens's frame sits inside the fixed lens's frame.
+    Returns (A, inliers): A is a 2x3 similarity transform mapping zoom-frame
+    pixels (both images resized to 960 wide) to fixed-frame pixels, or None.
+    The camera's date/time and channel-name OSD is identical in both lenses
+    and would match itself — masked out."""
+    W = 960
+    def prep(x):
+        g = cv2.cvtColor(cv2.resize(x, (W, int(x.shape[0] * W / x.shape[1]))), cv2.COLOR_BGR2GRAY)
+        g = cv2.createCLAHE(2.0, (8, 8)).apply(g)
+        m = np.full(g.shape, 255, np.uint8)
+        m[: int(g.shape[0] * 0.09)] = 0
+        m[int(g.shape[0] * 0.9):] = 0
+        return g, m
+    (gf, mf), (gp, mp) = prep(fixed), prep(ptz)
+    sift = cv2.SIFT_create(3000)
+    kf, df = sift.detectAndCompute(gf, mf)
+    kp, dp = sift.detectAndCompute(gp, mp)
+    if df is None or dp is None or len(kf) < 2 or len(kp) < 2:
+        return None, 0
+    pairs = cv2.BFMatcher().knnMatch(dp, df, k=2)
+    good = [a for a, b in (x for x in pairs if len(x) == 2) if a.distance < 0.75 * b.distance]
+    if len(good) < min_inliers:
+        return None, len(good)
+    src = np.float32([kp[g.queryIdx].pt for g in good])
+    dst = np.float32([kf[g.trainIdx].pt for g in good])
+    A, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0)
+    n = int(inl.sum()) if inl is not None else 0
+    return (A, n) if A is not None and n >= min_inliers else (None, n)
 
 
 def cone_boxes(img, horizon=0.35):
