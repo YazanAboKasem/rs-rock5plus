@@ -137,6 +137,7 @@ DEFAULTS = {
     "fixed_vp_conf": 0.4,
     "fixed_vp_window": 600,
     "fixed_vp_min": 4,
+    "prior_vp_conf": 0.5,         # confidence for a reading to join the per-camera road point
     # Frames with less detail than this (road_geometry.texture) and no cone
     # colour are not saved and stop the sweep zooming further: ceilings,
     # walls up close, noise-only frames at long zoom at night score 1–3;
@@ -248,6 +249,9 @@ class Camera:
         self.match_scale = None
         self.clock_synced = 0.0
         self.last_vp_check = 0.0
+        self.prior_file = os.path.join(os.path.dirname(SETTINGS_JSON), f"road_vp_{self.name}.json")
+        self.prior_pts = self._load_prior()
+        self.prior_dirty = 0
 
     # ── ISAPI ──
     def snapshot(self, channel: int) -> bytes | None:
@@ -393,6 +397,8 @@ class Camera:
                     meta["vanishing_point"] = {"x": round(r[0], 4), "y": round(r[1], 4), "conf": round(r[2], 2)}
                     if r[2] >= cfg["fixed_vp_conf"]:
                         self.fixed_vps.append((now, r[0], r[1]))
+                    if r[2] >= cfg["prior_vp_conf"]:
+                        self._add_prior(r[0], r[1])
                 if cones:
                     meta["cone_boxes"] = [[round(v, 4) for v in b] for b in cones]
                 self.fixed_cones = (now, cones)
@@ -414,6 +420,55 @@ class Camera:
         mx, my = xs[len(xs) // 2], ys[len(ys) // 2]
         near = sum(1 for _, x, y in self.fixed_vps if abs(x - mx) < 0.05 and abs(y - my) < 0.05)
         return (mx, my) if near >= 0.6 * len(self.fixed_vps) else None
+
+    # The fixed lens is bolted to the car, so where the road behind it
+    # vanishes barely changes from day to day. Remember it per camera: on
+    # roads where a single frame can't be read (grass streaked by motion at
+    # night, heavy traffic) the sweep still aims down the road.
+    def _load_prior(self) -> list:
+        try:
+            with open(self.prior_file) as f:
+                return [tuple(p) for p in json.load(f)["points"]][-400:]
+        except (OSError, ValueError, KeyError, TypeError):
+            return []
+
+    def _add_prior(self, x: float, y: float):
+        self.prior_pts = (self.prior_pts + [(round(x, 4), round(y, 4))])[-400:]
+        self.prior_dirty += 1
+        if self.prior_dirty >= 10:
+            self.prior_dirty = 0
+            try:
+                os.makedirs(os.path.dirname(self.prior_file), exist_ok=True)
+                with open(self.prior_file + ".part", "w") as f:
+                    json.dump({"points": self.prior_pts}, f)
+                os.replace(self.prior_file + ".part", self.prior_file)
+            except OSError:
+                pass
+
+    def road_prior(self):
+        pts = self.prior_pts
+        if len(pts) < 15:
+            return None
+        xs, ys = sorted(p[0] for p in pts), sorted(p[1] for p in pts)
+        mx, my = xs[len(xs) // 2], ys[len(ys) // 2]
+        near = sum(1 for x, y in pts if abs(x - mx) < 0.05 and abs(y - my) < 0.05)
+        return (mx, my) if near >= 0.5 * len(pts) else None
+
+    def bootstrap_prior(self, cfg: dict):
+        """First run: learn the road point from fixed-lens images already on disk."""
+        if len(self.prior_pts) >= 15 or not load_image_libs():
+            return
+        import glob
+        files = sorted(glob.glob(os.path.join(DATASET_DIR, self.device, self.name, "fixed", "*", "*.jpg")))
+        step = max(1, len(files) // 150)
+        for path in files[::-1][::step][:150]:
+            if not running:
+                return
+            img = cv2.imread(path)
+            r = RG.vanishing_point(img) if img is not None else None
+            if r and r[2] >= cfg["prior_vp_conf"]:
+                self._add_prior(r[0], r[1])
+        log.info("%s road point learnt from %d stored images: %s", self.ip, len(self.prior_pts), self.road_prior())
 
     # ── PTZ sweep ──
     def ptz_settled(self, timeout=20.0) -> dict | None:
@@ -563,7 +618,7 @@ class Camera:
             # point, mapped onto the zoom lens. Fallback: the vanishing point
             # in the zoom lens's own 1x frame, refined at 3x.
             az0, el0 = az1, el1
-            road = self.road_from_fixed(cfg) if to_angles else None
+            road = (self.road_from_fixed(cfg) or self.road_prior()) if to_angles else None
             road = to_angles(*road) if road else None
             if road:
                 pan, tilt = road
@@ -614,6 +669,7 @@ class Camera:
 
     def run(self):
         next_fixed = next_sweep = 0.0
+        bootstrapped = False
         while running:
             cfg = settings()
             if not cfg["enabled"]:
@@ -622,6 +678,9 @@ class Camera:
             if not self.detect_layout():
                 time.sleep(5)
                 continue
+            if not bootstrapped and self.has_ptz and load_image_libs():
+                bootstrapped = True
+                self.bootstrap_prior(cfg)
             now = time.time()
             if now - self.clock_synced > 3600:
                 self.clock_synced = now
