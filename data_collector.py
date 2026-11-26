@@ -137,7 +137,9 @@ DEFAULTS = {
     "fixed_vp_conf": 0.4,
     "fixed_vp_window": 600,
     "fixed_vp_min": 4,
-    "prior_vp_conf": 0.5,         # confidence for a reading to join the per-camera road point
+    "prior_vp_conf": 0.5,
+    "moving_diff": 5.0,           # fixed-lens frame-to-frame change above this = driving
+    "max_zoom_moving": 6,         # zoom cap while driving (12x/25x smear at night)         # confidence for a reading to join the per-camera road point
     # Frames with less detail than this (road_geometry.texture) and no cone
     # colour are not saved and stop the sweep zooming further: ceilings,
     # walls up close, noise-only frames at long zoom at night score 1–3;
@@ -249,6 +251,8 @@ class Camera:
         self.match_scale = None
         self.clock_synced = 0.0
         self.last_vp_check = 0.0
+        self.prev_thumb = None
+        self.motion = (0.0, 0.0)       # (time, smoothed frame-to-frame change of the fixed lens)
         self.prior_file = os.path.join(os.path.dirname(SETTINGS_JSON), f"road_vp_{self.name}.json")
         self.prior_pts = self._load_prior()
         self.prior_dirty = 0
@@ -375,6 +379,12 @@ class Camera:
         now = time.time()
         libs = load_image_libs()
         thumb = RG.thumb_jpeg(jpeg) if libs else None
+        if thumb is not None and self.prev_thumb is not None:
+            # how fast the scene changes, frame to frame: parked 1–2, driving 7–28
+            d = float(abs(thumb - self.prev_thumb).mean())
+            self.motion = (now, d if self.motion[0] < now - 30 else 0.6 * self.motion[1] + 0.4 * d)
+        if thumb is not None:
+            self.prev_thumb = thumb
         if thumb is not None and self.last_thumb is not None:
             unchanged = float(abs(thumb - self.last_thumb).mean()) < cfg["fixed_diff"]
         else:
@@ -633,8 +643,13 @@ class Camera:
                     pan, tilt = self.frame_to_angles(r["vp"][0], r["vp"][1], 3, cfg)
                     az0, el0 = az0 + round(pan * 10), el0 + round(tilt * 10)
                     aimed, aim_by = True, "ptz"
+            # Long zoom from a moving car is a smear (night shutter); keep 12x/25x
+            # for when the car stands still — a TMA parked at a work zone.
+            moving = time.time() - self.motion[0] < 60 and self.motion[1] > cfg["moving_diff"]
             for zoom, pans, tilts in cfg["sweep_plan"]:
                 if zoom > 3 and not aimed:
+                    break
+                if moving and zoom > cfg["max_zoom_moving"]:
                     break
                 level_ok = False
                 for tilt in tilts:
@@ -664,6 +679,8 @@ class Camera:
         parts = ([f"aimed at the road ({aim_by} lens)"] if aimed else []) + \
                 ([f"{n_cones} cones zoomed ({how or 'ptz'} lens)"] if n_cones else []) + \
                 ([f"{self.blank} blank skipped"] if self.blank else [])
+        if aimed and moving:
+            parts.append(f"moving — zoom ≤{cfg['max_zoom_moving']}x")
         log.info("%s PTZ sweep: %d images (%s)", self.ip, n, ", ".join(parts) if parts else
                  f"no road or cones found — 1x/3x only, {self.no_road_streak} in a row")
 
